@@ -1,3 +1,4 @@
+import hashlib
 import threading
 import time
 from collections import deque
@@ -228,6 +229,22 @@ class XenseTactileReader:
         self.force_width = int(force_width)
         self.name = name
         self._Sensor = Sensor
+        self._sensor = None
+        # Validate the API before opening a device. SDK 2.1.3 has TimeStamp,
+        # but does not expose CaptureTimeStamp.
+        self._capture_output = getattr(Sensor.OutputType, "CaptureTimeStamp", None)
+        self._outputs = (
+            Sensor.OutputType.TimeStamp,
+            Sensor.OutputType.ForceResultant,
+            Sensor.OutputType.Force,
+            Sensor.OutputType.Depth,
+            Sensor.OutputType.Rectify,
+        )
+        if self._capture_output is not None:
+            self._outputs += (self._capture_output,)
+        self._image_digest = None
+        self._last_capture_timestamp = 0.0
+        self._last_sdk_timestamp = 0.0
         self.device_label = (
             f"cam_id={self.cam_id}"
             if self.cam_id is not None
@@ -239,32 +256,74 @@ class XenseTactileReader:
                     self._sensor = Sensor.create(cam_id=self.cam_id)
                 else:
                     self._sensor = Sensor.create(self.serial_number)
-        except Exception as exc:
+            if self._capture_output is None:
+                print(
+                    f"Xense {self.name}: SDK has no CaptureTimeStamp; using "
+                    "TimeStamp with image deduplication. This is an estimated "
+                    "software frame time, not a hardware capture timestamp."
+                )
+            print(f"Xense {self.name} tactile ready: {self.device_label}")
+        except BaseException as exc:
+            try:
+                self.close()
+            except Exception as cleanup_exc:
+                print(f"Xense {self.name} cleanup after initialization failed: {cleanup_exc}")
+            if not isinstance(exc, Exception):
+                raise
             raise RuntimeError(
                 f"Failed to open Xense {self.name} tactile sensor "
                 f"{self.device_label}: {exc}"
             ) from exc
-        self._outputs = (
-            Sensor.OutputType.TimeStamp,
-            Sensor.OutputType.ForceResultant,
-            Sensor.OutputType.Force,
-            Sensor.OutputType.Depth,
-            Sensor.OutputType.Rectify,
-            Sensor.OutputType.CaptureTimeStamp,
-        )
-        print(f"Xense {self.name} tactile ready: {self.device_label}")
+
+    def _estimated_capture_time(self, timestamp: object, rectify: object) -> float:
+        """Guard older SDK result times against re-inference of identical images.
+
+        Called under _XENSE_SDK_LOCK. Never restamp an old image with host time.
+        This cannot reconstruct the unavailable physical capture time.
+        """
+        stamp = _float_or_zero(timestamp)
+        if not np.isfinite(stamp) or stamp <= 0:
+            raise RuntimeError("Xense returned an invalid SDK timestamp")
+        if stamp < self._last_sdk_timestamp:
+            raise RuntimeError("Xense SDK timestamp went backwards; restart the node")
+        self._last_sdk_timestamp = stamp
+        image = np.asarray(rectify) if rectify is not None else None
+        if image is None or image.ndim < 2 or image.size == 0 or image.dtype.hasobject:
+            raise RuntimeError("Xense SDK timestamp fallback requires a valid Rectify image")
+        image = np.ascontiguousarray(image)
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str((image.shape, image.dtype.str)).encode("ascii"))
+        digest.update(image.view(np.uint8))
+        signature = digest.digest()
+        if signature != self._image_digest and stamp > self._last_capture_timestamp:
+            self._image_digest = signature
+            self._last_capture_timestamp = stamp
+        return self._last_capture_timestamp
 
     def read(self) -> dict[str, np.ndarray | float | bool]:
         try:
             with _XENSE_SDK_LOCK:
+                if self._sensor is None:
+                    raise RuntimeError("Xense sensor is closed")
                 values = self._sensor.selectSensorInfo(*self._outputs)
+                if not isinstance(values, tuple):
+                    values = (values,)
+                # SDK buffers may be reused after the next call.
+                values = tuple(value.copy() if isinstance(value, np.ndarray) else value
+                               for value in values)
+                capture_timestamp = None
+                if len(values) >= 3:
+                    if self._capture_output is not None:
+                        capture_timestamp = values[5] if len(values) > 5 else None
+                    else:
+                        capture_timestamp = self._estimated_capture_time(
+                            values[0], values[4] if len(values) > 4 else None,
+                        )
         except Exception as exc:
             raise RuntimeError(
                 f"Xense {self.name} read failed for {self.device_label}: {exc}"
             ) from exc
 
-        if not isinstance(values, tuple):
-            values = (values,)
         if len(values) < 3:
             frame = empty_xense_tactile_frame(self.force_height, self.force_width)
             frame["host_timestamp"] = time.time()
@@ -273,7 +332,6 @@ class XenseTactileReader:
         sensor_timestamp, force6d, force = values[:3]
         depth = values[3] if len(values) > 3 else None
         rectify = values[4] if len(values) > 4 else None
-        capture_timestamp = values[5] if len(values) > 5 else None
         return format_xense_tactile_frame(
             {
                 "force": force,
@@ -293,9 +351,11 @@ class XenseTactileReader:
         )
 
     def close(self) -> None:
-        release = getattr(self._sensor, "release", None)
-        if callable(release):
-            with _XENSE_SDK_LOCK:
+        with _XENSE_SDK_LOCK:
+            sensor = self._sensor
+            self._sensor = None
+            release = getattr(sensor, "release", None)
+            if callable(release):
                 release()
 
 

@@ -97,8 +97,16 @@ python tactile_policy/infer_tactile_servo_nutbolt_miben_lhy_new.py \
   打开后立即后台接收，避免等待续采选择或去零期间积压。可选 FTDI 低延迟模式在关闭时恢复；
   `--force-source modbus-serial` 可使用原问答模式。后台样本默认超过 `0.1 s` 或读取失败时，
   跳过该轮运动和记录，不使用旧力数据。
-- 双 Xense 公平排队访问 SDK；创建 ONNX 会话时使用 intra-op `6`、inter-op `1` 并关闭自旋。
-  以原始 `CaptureTimeStamp` 去重；录制最多回看上一帧，控制与保护使用最新触觉。
+- 双 Xense 默认 `--xense-backend process`，每个传感器在独立的 `spawn` 子进程中创建、读取、释放 SDK，
+  避免两个传感器共用 SDK 锁造成串行推理和帧超时。共享内存只保留最新结果，不排队积压旧图；
+  SDK 异常或子进程退出会向采集端报错。子进程内限制 OpenCV 线程为 `1`，
+  ONNX 会话使用 intra-op `6`、inter-op `1` 并关闭自旋。
+  可用 `--xense-backend thread` 回到原公平排队线程模式作对照。
+  SDK 支持 `CaptureTimeStamp` 时以该时间去重；本机 `xensesdk==2.1.3` 不提供此字段，
+  兼容模式使用 `TimeStamp`，并对 `Rectify` 图像摘要去重：相同图像不会因重复推理而刷新有效期。
+  这是软件帧时间估计，不是硬件采样时间，不能据此承诺严格同步；完全相同的新图也会保守地视为重复帧。
+  缺少有效图像/时间戳时报告错误，不使用当前主机时间伪装为新帧。
+  录制最多回看上一帧，控制与保护使用最新触觉。
   停更或捕获结果超过 `0.15 s` 时报告错误，可通过启动器的 `--xense-max-age-s` 调整。
 - 相机默认 `640×480 @ 30 fps`；采集使用 RGB 专用接口并携带原生帧时间，省去零深度占位图的分配和传输。
   兼容原 RGB/深度接口，以及 `--camera-backend gello` / `realsense`。

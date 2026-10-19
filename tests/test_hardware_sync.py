@@ -467,7 +467,8 @@ def test_auto_cycle_survives_alignment_skip_and_waits_for_gripper(collector, mon
     assert report['saved_rows'] == 1 and report['preparation']['waiting_loops'] == 1
 
 
-def test_launcher_cleans_up_when_second_tactile_sensor_cannot_start(monkeypatch):
+@pytest.mark.parametrize('backend', ['process', 'thread'])
+def test_launcher_cleans_up_when_second_tactile_sensor_cannot_start(monkeypatch, backend):
     import launch_nodes as launch
     closed = []
     class Server:
@@ -480,7 +481,7 @@ def test_launcher_cleans_up_when_second_tactile_sensor_cannot_start(monkeypatch)
         def close(self):
             closed.append('server')
     class Sensor:
-        def __init__(self, serial, *, cam_id, force_height, force_width, name):
+        def __init__(self, serial, *, cam_id, force_height, force_width, name, **kwargs):
             if 'right' in name:
                 raise RuntimeError('simulated second sensor startup failure')
         def close(self):
@@ -497,8 +498,10 @@ def test_launcher_cleans_up_when_second_tactile_sensor_cannot_start(monkeypatch)
     monkeypatch.setattr(launch, 'ZMQServerRobot', Server)
     monkeypatch.setattr(launch, 'ZMQServerTactile', Server)
     monkeypatch.setattr(launch, 'XenseTactileReader', Sensor)
+    monkeypatch.setattr(launch, 'ProcessXenseTactileReader', Sensor)
     monkeypatch.setattr(launch, 'AsyncXenseTactileReader', AsyncSensor)
     with pytest.raises(RuntimeError, match='second sensor startup failure'):
-        launch.launch_robot_server(launch.Args(enable_camera=False, xense_max_age_s=.23))
+        launch.launch_robot_server(launch.Args(enable_camera=False, xense_max_age_s=.23,
+                                                xense_backend=backend))
     assert closed.count('server') == 2
     assert closed.count('sensor') == 1 and closed[-1] == 'robot'

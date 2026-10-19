@@ -16,6 +16,7 @@ from gello.tactile.xense import (
     XENSE_DEFAULT_RIGHT_SERIAL,
     XenseTactileReader,
 )
+from gello.tactile.xense_process import ProcessXenseTactileReader
 from gello.zmq_core.camera_node import ZMQServerCamera
 from gello.zmq_core.robot_node import ZMQServerRobot
 from gello.zmq_core.tactile_node import ZMQServerTactile
@@ -51,6 +52,7 @@ class Args:
     xense_right_cam_id: int | None = None
     xense_force_height: int = XENSE_DEFAULT_FORCE_HEIGHT
     xense_force_width: int = XENSE_DEFAULT_FORCE_WIDTH
+    xense_backend: Literal["process", "thread"] = "process"
     xense_poll_interval_s: float = 0.0
     xense_warmup_timeout_s: float = 2.0
     xense_max_age_s: float = 0.15
@@ -115,21 +117,28 @@ def _launch_servers(args: Args, robot) -> None:
         cam_id: int | None,
         name: str,
     ) -> AsyncXenseTactileReader:
-        reader = XenseTactileReader(
+        process_backend = args.xense_backend == "process"
+        reader_type = ProcessXenseTactileReader if process_backend else XenseTactileReader
+        reader = reader_type(
             None if cam_id is not None else serial_number,
             cam_id=cam_id,
             force_height=args.xense_force_height,
             force_width=args.xense_force_width,
             name=name,
+            **({"poll_interval_s": args.xense_poll_interval_s} if process_backend else {}),
         )
-        async_reader = AsyncXenseTactileReader(
-            reader,
-            force_height=args.xense_force_height,
-            force_width=args.xense_force_width,
-            poll_interval_s=args.xense_poll_interval_s,
-            name=name,
-            max_age_s=args.xense_max_age_s,
-        )
+        try:
+            async_reader = AsyncXenseTactileReader(
+                reader,
+                force_height=args.xense_force_height,
+                force_width=args.xense_force_width,
+                poll_interval_s=0.0 if process_backend else args.xense_poll_interval_s,
+                name=name,
+                max_age_s=args.xense_max_age_s,
+            )
+        except BaseException:
+            reader.close()
+            raise
         tactiles.append(async_reader)
         if not async_reader.wait_for_frame(args.xense_warmup_timeout_s):
             print(
