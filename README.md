@@ -133,3 +133,28 @@ python real_ur5rg2/collect_lerobot_xenstactile_servo_control.py \
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_hardware_sync.py
 ```
 
+
+## 其他采集与推理入口
+
+`real_ur5rg2/collect_lerobot_smolvla_real_xenstactile_w_force.py` 同样接入后台力采样、
+异步夹爪、RGB 专用传输、触觉捕获缓冲、软件时间配对、续采后台 PNG 和性能记录。
+保留该入口原有的 `.force` 数据字段、标定和手动 `L` 复位行为；原伺服采集入口继续使用
+`.distributed_force` 和原有的自动 `L` 流程，两种数据字段不会相互改名。
+新入口默认以 `30 Hz`、`640×480` 保存到 `./data/ur5_smolvla_30hz`。
+续采旧数据时指定原目录及原参数，例如 `--fps 20 --image-size 256 --resume`。
+
+两份 `tactile_policy/infer_tactile_servo_nutbolt_miben_lhy*.py` 也支持默认
+`--force-source fts300-stream`，以及 `--force-source modbus-serial` 的后台采样。
+它们沿用原有 `--use-force-safety` 开关：启用时才打开力传感器，关闭时不打开串口。
+采样从力读取器初始化时启动，校准、等待执行确认和推理期间持续接收；主循环读取最新缓存，
+默认超过 `--force-max-age-s 0.1` 或后台报错时停止正常推理命令。
+`--force-serial-low-latency` 可控制连续流的适配器低延迟模式，退出时恢复并关闭串口。
+Modbus TCP / UR RTDE 力源、原有控制频率、阈值、标定和动作阶段保持原实现。
+双触觉在转换图像前先读取两路快照；夹爪仍使用同步等待，以兼容原推理阶段。
+
+同一力串口由当前采集或推理进程占用；切换入口前先退出占用该串口的进程。
+补充入口回归测试：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_entrypoint_sync.py
+```

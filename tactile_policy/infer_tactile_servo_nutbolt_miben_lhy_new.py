@@ -19,6 +19,7 @@ configured grasp and bolt-contact TCP poses.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import select
 import sys
 import threading
@@ -37,9 +38,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from gello.zmq_core.robot_node import ZMQClientRobot
 from gello.zmq_core.tactile_node import ZMQClientTactile
 from gello.force.robotiq_fts300 import (
+    AsyncForceReader,
     RobotiqFTS300ModbusSerial,
     RobotiqFTS300ModbusTCP,
 )
+from gello.force.robotiq_fts300_stream import RobotiqFTS300Stream
 from tactile_policy.data import Normalization, signed_log1p
 from tactile_policy.model import create_model
 
@@ -256,9 +259,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--force-source",
-        choices=("modbus-serial", "modbus-tcp", "ur-rtde"),
-        default="modbus-serial",
-        help="Read force from Robotiq FTS-300-S Modbus RTU/TCP or UR RTDE.",
+        choices=("fts300-stream", "modbus-serial", "modbus-tcp", "ur-rtde"),
+        default="fts300-stream",
+        help="Read FT300-S 100 Hz stream (default), Modbus RTU/TCP, or UR RTDE.",
     )
     parser.add_argument("--force-serial-port", default=None)
     parser.add_argument("--force-serial-slave-address", type=int, default=9)
@@ -269,9 +272,17 @@ def parse_args() -> argparse.Namespace:
         "--force-serial-timeout-s",
         type=float,
         default=0.1,
-        help="Modbus RTU response timeout. 0.1s avoids truncated FTS-300-S frames.",
+        help="Serial response timeout; samples are received in the background.",
     )
     parser.add_argument("--force-serial-retries", type=int, default=5)
+    parser.add_argument(
+        "--force-serial-low-latency", action=argparse.BooleanOptionalAction,
+        default=True, help="Temporarily enable adapter low-latency mode for FT streaming.",
+    )
+    parser.add_argument(
+        "--force-max-age-s", type=float, default=0.1,
+        help="Maximum background force sample age; stale/error samples stop inference.",
+    )
     parser.add_argument(
         "--force-serial-wakeup",
         action=argparse.BooleanOptionalAction,
@@ -306,6 +317,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--yes", action="store_true", help="Skip the final RUN prompt.")
     args = parser.parse_args()
+    for name in ("force_max_age_s", "force_serial_timeout_s"):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive and finite")
 
     # 阈值必须有限且为正；接触窗口必须小于固定的 50 mm 上方高度，
     # 避免将整个搬运上方区域都当作允许开始装配的接触范围。
@@ -583,11 +597,13 @@ class TactileSource:
         self.right.close()
 
     def read(self) -> tuple[dict, dict]:
+        # Take both snapshots before converting either tactile image.
+        frames = (self.left.read(), self.right.read())
         values = []
-        for client in (self.left, self.right):
+        for frame in frames:
             values.append(
                 format_tactile_frame(
-                    client.read(),
+                    frame,
                     self.args.xense_force_height,
                     self.args.xense_force_width,
                 )
@@ -669,13 +685,23 @@ def format_force_torque(force_torque: np.ndarray) -> np.ndarray:
 
 
 class ForceReader:
-    """Read wrench data through the same path used by the collection script."""
+    """Read current wrench values without serial transactions in the inference loop."""
 
     def __init__(self, args: argparse.Namespace, robot: ZMQClientRobot) -> None:
         self.source = args.force_source
         self._robot = robot
         self._modbus = None
-        if self.source == "modbus-serial":
+        self._background = None
+        self._closed = False
+        if self.source == "fts300-stream":
+            self._modbus = RobotiqFTS300Stream(
+                port=args.force_serial_port,
+                slave_address=args.force_serial_slave_address,
+                baudrate=args.force_serial_baudrate,
+                timeout_s=args.force_serial_timeout_s,
+                low_latency=args.force_serial_low_latency,
+            )
+        elif self.source == "modbus-serial":
             self._modbus = RobotiqFTS300ModbusSerial(
                 port=args.force_serial_port,
                 slave_address=args.force_serial_slave_address,
@@ -699,7 +725,19 @@ class ForceReader:
                 timeout_s=args.force_modbus_timeout_s,
             )
 
+        if self.source in ("fts300-stream", "modbus-serial"):
+            try:
+                self._background = AsyncForceReader(self._modbus, max_age_s=args.force_max_age_s)
+                self._background.wait_until_ready()
+            except BaseException:
+                self.close()
+                raise
+
     def read(self) -> np.ndarray:
+        if self._closed:
+            raise RuntimeError("Force reader is closed")
+        if self._background is not None:
+            return self._background.read()
         if self.source in ("modbus-serial", "modbus-tcp"):
             if self._modbus is None:
                 raise RuntimeError("Modbus force reader is not initialized")
@@ -709,9 +747,16 @@ class ForceReader:
         raise RuntimeError(f"Unsupported force source: {self.source}")
 
     def close(self) -> None:
-        close = getattr(self._modbus, "close", None)
-        if close is not None:
-            close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._background is not None:
+            # The worker cancels pending reads, joins, and closes its own port.
+            self._background.close()
+        else:
+            close = getattr(self._modbus, "close", None)
+            if close is not None:
+                close()
 
 
 # 新增：独立保留采集脚本的灰度转换，迁移时无需携带采集脚本。
@@ -2112,10 +2157,12 @@ def main() -> None:
     robot = ZMQClientRobot(
         port=args.robot_port, host=args.host, timeout_ms=args.robot_timeout_ms
     )
-    tactile = TactileSource(args)
-    force_logger = TactileForceLogger(args)
+    tactile = None
+    force_logger = None
     force_reader = None
     try:
+        tactile = TactileSource(args)
+        force_logger = TactileForceLogger(args)
         if robot.num_dofs() != 7:
             raise RuntimeError("expected a 7-DoF UR5 + RG2 robot server")
         if args.use_force_safety:
@@ -2192,11 +2239,14 @@ def main() -> None:
         print(f"SAFETY STOP: {exc}. No further motion commands will be sent.")
         raise
     finally:
-        force_logger.close()
-        if force_reader is not None:
-            force_reader.close()
-        tactile.close()
-        robot.close()
+        with ExitStack() as cleanup:
+            cleanup.callback(robot.close)
+            if tactile is not None:
+                cleanup.callback(tactile.close)
+            if force_reader is not None:
+                cleanup.callback(force_reader.close)
+            if force_logger is not None:
+                cleanup.callback(force_logger.close)
 
 
 if __name__ == "__main__":
