@@ -62,9 +62,23 @@ class RealSenseCamera(CameraDriver):
         self._pipeline.start(config)
         self._flip = flip
 
-    def read(
+    def read(self, img_size=None):
+        return self._read(img_size)
+
+    def read_with_timestamp(self, img_size=None):
+        return self._read(img_size, with_timestamp=True)
+
+    def read_rgb(self, img_size=None):
+        return self.read_rgb_with_timestamp(img_size)["image"]
+
+    def read_rgb_with_timestamp(self, img_size=None):
+        return self._read(img_size, with_timestamp=True, include_depth=False)
+
+    def _read(
         self,
         img_size: Optional[Tuple[int, int]] = None,  # farthest: float = 0.12
+        with_timestamp: bool = False,
+        include_depth: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Read a frame from the camera.
 
@@ -80,31 +94,33 @@ class RealSenseCamera(CameraDriver):
 
         frames = None
         last_error = None
-        for _ in range(3):
+        for _ in range(1 if with_timestamp else 3):
             try:
-                frames = self._pipeline.wait_for_frames(timeout_ms=5000)
+                frames = self._pipeline.wait_for_frames(timeout_ms=200 if with_timestamp else 5000)
                 break
             except RuntimeError as exc:
                 last_error = exc
                 time.sleep(0.02)
         if frames is None:
-            if self._last_image is not None and self._last_depth is not None:
+            if not with_timestamp and self._last_image is not None and self._last_depth is not None:
                 print(f"[{self}] frame timeout, reusing last frame")
                 return self._last_image.copy(), self._last_depth.copy()
             raise RuntimeError(f"{self} failed to read frames: {last_error}")
 
         color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame() if self._enable_depth else None
-        if not color_frame or (self._enable_depth and not depth_frame):
-            if self._last_image is not None and self._last_depth is not None:
+        depth_frame = frames.get_depth_frame() if include_depth and self._enable_depth else None
+        if not color_frame or (include_depth and self._enable_depth and not depth_frame):
+            if not with_timestamp and self._last_image is not None and self._last_depth is not None:
                 print(f"[{self}] incomplete frame, reusing last frame")
                 return self._last_image.copy(), self._last_depth.copy()
             raise RuntimeError(f"{self} returned an incomplete frame")
 
         color_image = np.asanyarray(color_frame.get_data())
+        host_timestamp = time.time()
+        depth_image = None
         if depth_frame:
             depth_image = np.asanyarray(depth_frame.get_data())
-        else:
+        elif include_depth:
             depth_image = np.zeros((self._height, self._width), dtype=np.uint16)
         # depth_image = cv2.convertScaleAbs(depth_image, alpha=0.03)
         if img_size is None:
@@ -112,18 +128,34 @@ class RealSenseCamera(CameraDriver):
             depth = depth_image
         else:
             image = cv2.resize(color_image, img_size)[:, :, ::-1]
-            depth = cv2.resize(depth_image, img_size)
+            depth = cv2.resize(depth_image, img_size) if include_depth else None
 
         # rotate 180 degree's because everything is upside down in order to center the camera
         if self._flip:
             image = cv2.rotate(image, cv2.ROTATE_180)
-            depth = cv2.rotate(depth, cv2.ROTATE_180)[:, :, None]
+            if include_depth:
+                depth = cv2.rotate(depth, cv2.ROTATE_180)[:, :, None]
         else:
-            depth = depth[:, :, None]
+            if include_depth:
+                depth = depth[:, :, None]
 
-        self._last_image = image
-        self._last_depth = depth
+        if include_depth:
+            # Keep the legacy fallback cache as a matching RGB/depth pair.
+            self._last_image = image
+            self._last_depth = depth
+        if with_timestamp:
+            frame = {"image": image.copy(),
+                     "capture_timestamp": color_frame.get_timestamp()/1000.0,
+                     "host_timestamp": host_timestamp,
+                     "timestamp_domain": str(color_frame.get_frame_timestamp_domain()),
+                     "frame_number": color_frame.get_frame_number()}
+            if include_depth:
+                frame["depth"] = depth.copy()
+            return frame
         return image, depth
+
+    def close(self):
+        self._pipeline.stop()
 
 
 def _debug_read(camera, save_datastream=False):

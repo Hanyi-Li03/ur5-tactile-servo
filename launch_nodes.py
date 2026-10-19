@@ -1,6 +1,7 @@
 """Start the real UR/RG2, RealSense, and Xense ZMQ nodes."""
 
 import threading
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Literal
 
@@ -37,9 +38,9 @@ class Args:
     base_camera_flip: bool = False
     camera_width: int = 640
     camera_height: int = 480
-    camera_fps: int = 15
+    camera_fps: int = 30
     enable_depth: bool = False
-    camera_backend: Literal["lerobot", "gello"] = "lerobot"
+    camera_backend: Literal["lerobot", "gello", "realsense"] = "lerobot"
     enable_tactile: bool = True
     tactile_source: Literal["xense"] = "xense"
     left_tactile_port: int = 5100
@@ -52,6 +53,7 @@ class Args:
     xense_force_width: int = XENSE_DEFAULT_FORCE_WIDTH
     xense_poll_interval_s: float = 0.0
     xense_warmup_timeout_s: float = 2.0
+    xense_max_age_s: float = 0.15
 
 
 def make_robot(args: Args):
@@ -66,12 +68,22 @@ def make_robot(args: Args):
 
 def launch_robot_server(args: Args) -> None:
     robot = make_robot(args)
+    try:
+        _launch_servers(args, robot)
+    finally:
+        close = getattr(robot, "close", None)
+        if callable(close):
+            close()
+
+
+def _launch_servers(args: Args, robot) -> None:
     robot_server = ZMQServerRobot(robot, port=args.robot_port, host=args.hostname)
     print(f"Starting robot server on port {args.robot_port}")
 
     threads = [threading.Thread(target=robot_server.serve, daemon=True)]
     servers = [robot_server]
     cameras = []
+    tactiles = []
 
     def make_camera(device_id: str, flip: bool):
         if args.camera_backend == "lerobot":
@@ -84,7 +96,7 @@ def launch_robot_server(args: Args) -> None:
                 height=args.camera_height,
                 fps=args.camera_fps,
             )
-        if args.camera_backend == "gello":
+        if args.camera_backend in ("gello", "realsense"):
             from gello.cameras.realsense_camera import RealSenseCamera
 
             return RealSenseCamera(
@@ -95,7 +107,7 @@ def launch_robot_server(args: Args) -> None:
                 fps=args.camera_fps,
                 enable_depth=args.enable_depth,
             )
-        raise ValueError("camera_backend must be 'lerobot' or 'gello'")
+        raise ValueError("camera_backend must be 'lerobot', 'gello', or 'realsense'")
 
     def make_xense(
         serial_number: str,
@@ -116,7 +128,9 @@ def launch_robot_server(args: Args) -> None:
             force_width=args.xense_force_width,
             poll_interval_s=args.xense_poll_interval_s,
             name=name,
+            max_age_s=args.xense_max_age_s,
         )
+        tactiles.append(async_reader)
         if not async_reader.wait_for_frame(args.xense_warmup_timeout_s):
             print(
                 f"Warning: no {name} frame arrived during async warmup; "
@@ -207,10 +221,14 @@ def launch_robot_server(args: Args) -> None:
         for thread in threads:
             if thread.is_alive():
                 thread.join(timeout=2.0)
-        for camera in reversed(cameras):
-            close = getattr(camera, "close", None)
-            if callable(close):
-                close()
+        with ExitStack() as cleanup:
+            for device in [*cameras, *tactiles]:
+                close = getattr(device, "close", None)
+                if callable(close):
+                    cleanup.callback(close)
+            for server, thread in zip(servers, threads):
+                if not thread.is_alive():
+                    cleanup.callback(server.close)
 
 
 def main(args: Args) -> None:

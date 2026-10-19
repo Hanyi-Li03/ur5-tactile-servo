@@ -2,6 +2,8 @@ import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass, replace
+from collections import deque
 from typing import Literal
 
 import numpy as np
@@ -10,6 +12,149 @@ import numpy as np
 ModbusFunction = Literal["holding", "input"]
 ModbusValueFormat = Literal["int16", "int32", "float32"]
 ModbusWordOrder = Literal["big", "little"]
+
+
+@dataclass(frozen=True)
+class ForceSample:
+    wrench: np.ndarray
+    read_started_monotonic: float
+    received_monotonic: float
+    sample_monotonic: float | None = None
+    timing_basis: str = "serial_query_midpoint"
+    sequence: int | None = None
+    timing_note: str | None = None
+
+    @property
+    def timestamp_monotonic(self):
+        return ((self.read_started_monotonic+self.received_monotonic)/2
+                if self.sample_monotonic is None else self.sample_monotonic)
+
+
+class AsyncForceReader:
+    """Own one force reader and publish its latest sample without blocking.
+
+    Freshness is measured from the start of the read, so a slow transaction
+    cannot make an old result appear new just because it has just returned.
+    The worker owns the underlying reader until close() has joined it.
+    """
+
+    def __init__(self, reader, *, max_age_s: float = 0.1) -> None:
+        if not np.isfinite(max_age_s) or max_age_s <= 0:
+            raise ValueError("Force sample max_age_s must be finite and positive")
+        self._reader = reader
+        self.max_age_s = float(max_age_s)
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._latest: ForceSample | None = None
+        self._history = deque(maxlen=32)
+        self._error: str | None = None
+        self._close_error: str | None = None
+        self._thread = threading.Thread(
+            target=self._poll_loop, name="fts300-serial", daemon=True
+        )
+        self._thread.start()
+
+    def _poll_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                started = time.monotonic()
+                try:
+                    timed_read = getattr(self._reader, "read_samples", None)
+                    if callable(timed_read):
+                        samples = timed_read()
+                    else:
+                        wrench = np.asarray(self._reader.read(), dtype=np.float32)
+                        samples = [ForceSample(wrench.copy(), started, time.monotonic())]
+                    if not samples:
+                        raise RuntimeError("Force reader returned no samples")
+                    for sample in samples:
+                        if sample.wrench.shape != (6,) or not np.isfinite(sample.wrench).all():
+                            raise RuntimeError("Force reader returned an invalid six-axis wrench")
+                except Exception as exc:
+                    with self._condition:
+                        self._error = str(exc)
+                        self._history.clear()
+                        self._condition.notify_all()
+                    self._stop_event.wait(0.02)
+                    continue
+                with self._condition:
+                    self._latest = samples[-1]
+                    self._history.extend(samples)
+                    self._error = None
+                    self._condition.notify_all()
+        finally:
+            try:
+                self._reader.close()
+            except Exception as exc:
+                self._close_error = str(exc)
+            with self._condition:
+                self._condition.notify_all()
+
+    def wait_until_ready(self, timeout_s: float = 1.0) -> None:
+        """Wait for the first sample during startup, outside the recording loop."""
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while self._latest is None and self._error is None:
+                if self._stop_event.is_set():
+                    raise RuntimeError("Force sampling is closed")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Timed out waiting for the first force sample")
+                self._condition.wait(remaining)
+        self.read_sample()
+
+    def read_sample(self) -> ForceSample:
+        with self._condition:
+            if self._stop_event.is_set():
+                raise RuntimeError("Force sampling is closed")
+            if self._error is not None:
+                raise RuntimeError(f"Background force read failed: {self._error}")
+            sample = self._latest
+            if sample is None:
+                raise RuntimeError("No force sample is available yet")
+            age_s = time.monotonic() - sample.read_started_monotonic
+            if age_s > self.max_age_s:
+                raise RuntimeError(
+                    f"Force sample is stale ({age_s * 1000:.1f} ms > "
+                    f"{self.max_age_s * 1000:.1f} ms)"
+                )
+            return replace(sample, wrench=sample.wrench.copy())
+
+    def read(self) -> np.ndarray:
+        return self.read_sample().wrench
+
+    def read_sample_at(self, target_monotonic: float, max_skew_s: float) -> ForceSample:
+        """Select history for recording; latest-sample checks still guard control."""
+        if not np.isfinite(target_monotonic) or not np.isfinite(max_skew_s) or max_skew_s <= 0:
+            raise ValueError("Force recording time and skew must be finite")
+        self.read_sample()
+        with self._condition:
+            if self._error is not None or self._stop_event.is_set():
+                raise RuntimeError("Force sample became unavailable")
+            candidates = [sample for sample in self._history
+                          if abs(sample.timestamp_monotonic-target_monotonic) <= max_skew_s]
+            if not candidates:
+                raise RuntimeError("No force sample near recording reference")
+            sample = min(candidates, key=lambda value: abs(value.timestamp_monotonic-target_monotonic))
+            return replace(sample, wrench=sample.wrench.copy())
+
+    def close(self) -> None:
+        self._stop_event.set()
+        with self._condition:
+            self._condition.notify_all()
+        cancel = getattr(self._reader, "cancel_read", None)
+        if cancel is not None and self._thread.is_alive():
+            cancel()
+        # Account for all configured serial attempts if cancellation interrupts
+        # only one pySerial read. The worker closes the port before it exits.
+        attempts = max(1, int(getattr(self._reader, "retries", 1)))
+        timeout_s = float(getattr(self._reader, "timeout_s", 0.1))
+        self._thread.join(timeout=max(1.0, attempts * (timeout_s + 0.02) + 0.5,
+                                      float(getattr(self._reader, "close_timeout_s", 0))))
+        if self._thread.is_alive():
+            raise RuntimeError("Force sampling thread did not exit; serial port is still in use")
+        if self._close_error is not None:
+            raise RuntimeError(f"Failed to close the force serial port: {self._close_error}")
 
 
 class RobotiqFTS300ModbusSerial:
@@ -30,7 +175,7 @@ class RobotiqFTS300ModbusSerial:
         bytesize: int = 8,
         parity: str = "N",
         stopbits: int = 1,
-        timeout_s: float = 0.02,
+        timeout_s: float = 0.1,
         wakeup: bool = True,
         retries: int = 3,
     ) -> None:
@@ -126,7 +271,19 @@ class RobotiqFTS300ModbusSerial:
         if serial_obj is not None and getattr(serial_obj, "is_open", False):
             serial_obj.close()
 
-    def _find_serial_port(self, serial_module) -> str | None:
+    def cancel_read(self) -> None:
+        """Interrupt a pending serial read when its sampling worker is stopped."""
+        serial_obj = getattr(self._instrument, "serial", None)
+        cancel = getattr(serial_obj, "cancel_read", None)
+        if cancel is not None and getattr(serial_obj, "is_open", False):
+            try:
+                cancel()
+            except OSError:
+                # The worker may have finished and closed the descriptor already.
+                pass
+
+    @staticmethod
+    def _find_serial_port(serial_module) -> str | None:
         for port_info in serial_module.tools.list_ports.comports():
             port_name = port_info.device
             description = port_info.description or ""

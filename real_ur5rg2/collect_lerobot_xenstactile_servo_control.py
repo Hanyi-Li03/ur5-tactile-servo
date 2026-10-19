@@ -1,4 +1,6 @@
 import argparse
+import json
+from contextlib import ExitStack
 import shutil
 import sys
 import time
@@ -16,11 +18,18 @@ from PIL import Image
 from real_ur5rg2.dataset_delete_utils import confirm_and_rmtree
 from gello.zmq_core.camera_node import ZMQClientCamera
 from gello.force.robotiq_fts300 import (
+    AsyncForceReader,
     RobotiqFTS300ModbusSerial,
     RobotiqFTS300ModbusTCP,
 )
+from gello.force.robotiq_fts300_stream import RobotiqFTS300Stream
 from gello.zmq_core.robot_node import ZMQClientRobot
 from gello.zmq_core.tactile_node import ZMQClientTactile
+from real_ur5rg2.image_writer import RecordingImageWriter
+from real_ur5rg2.recording_time import (
+    RecordingAlignmentError, RecordingHistory, RecordingPerformance,
+    RecordingSampleUnavailable, RecordingTimeAlignment, RecordingWarmup, timing_entry,
+)
 
 
 TACTILE_FIELD_KEYS = (
@@ -247,18 +256,22 @@ lerobot_dataset_module.aggregate_stats = aggregate_stats_with_channelwise_tactil
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Collect LeRobot/SmolVLA episodes on a real UR5 + RG2 with "
+            "Collect LeRobot episodes on a UR5 + RG2 with "
             "dual Xense tactile sensors and keyboard teleop."
         )
     )
     parser.add_argument("--repo-id", default="ur5_rg2_real_smolvla_xense_tactile")
     parser.add_argument(
         "--root",
-        default="./real_ur5rg2/data/L1_5000_ur5_rg2_real_dataset_xense_tactile_boltnut_demo",
+        default="./data/ur5_tactile_30hz",
     )
     parser.add_argument("--task", default="Insert the bolt into the nut.")
     parser.add_argument("--num-episodes", type=int, default=20)
-    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--image-png-compress-level", type=int, default=1,
+        choices=range(10), help="Lossless PNG compression, 0-9; lower values use less CPU.",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--robot-port", type=int, default=6001)
     parser.add_argument(
@@ -272,6 +285,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-tactile-port", type=int, default=5100)
     parser.add_argument("--right-tactile-port", type=int, default=5101)
     parser.add_argument("--tactile-timeout-ms", type=int, default=15000)
+    parser.add_argument(
+        "--tactile-recording-buffer", action=argparse.BooleanOptionalAction, default=True,
+        help="Record each capture once with up to one earlier frame of slack; control uses latest values.",
+    )
+    parser.add_argument(
+        "--recording-time-alignment", action=argparse.BooleanOptionalAction, default=True,
+        help="Match saved sensor samples to a common capture time; control still uses latest samples.",
+    )
+    parser.add_argument(
+        "--recording-max-skew-ms", type=float, default=20.0,
+        help="Maximum sample distance from the recording reference, in milliseconds (default: 20).",
+    )
     parser.add_argument(
         "--collect-tactile",
         action=argparse.BooleanOptionalAction,
@@ -328,17 +353,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--force-source",
-        choices=("modbus-serial", "modbus-tcp", "ur-rtde"),
-        default="modbus-serial",
-        help="Read force from Robotiq FTS-300-S Modbus RTU/TCP or UR RTDE TCP force.",
+        choices=("fts300-stream", "modbus-serial", "modbus-tcp", "ur-rtde"),
+        default="fts300-stream",
+        help="Read FT300-S 100 Hz stream (default), Modbus RTU/TCP, or UR TCP force.",
     )
     parser.add_argument("--force-serial-port", default=None)
     parser.add_argument("--force-serial-slave-address", type=int, default=9)
     parser.add_argument("--force-serial-register-address", type=int, default=180)
     parser.add_argument("--force-serial-function-code", type=int, default=3)
     parser.add_argument("--force-serial-baudrate", type=int, default=19200)
-    parser.add_argument("--force-serial-timeout-s", type=float, default=0.02)
+    parser.add_argument("--force-serial-timeout-s", type=float, default=0.1)
     parser.add_argument("--force-serial-retries", type=int, default=3)
+    parser.add_argument("--force-serial-low-latency", action=argparse.BooleanOptionalAction,
+                        default=True, help="Temporarily use adapter low-latency mode for FT streaming; restore on close.")
+    parser.add_argument(
+        "--force-max-age-s", type=float, default=0.1,
+        help="Maximum age of a background serial force sample, measured from read start.",
+    )
     parser.add_argument(
         "--force-serial-wakeup",
         action=argparse.BooleanOptionalAction,
@@ -519,7 +550,23 @@ def parse_args() -> argparse.Namespace:
         default=0.03,
         help="Torque deadband in Nm to avoid chattering near the threshold.",
     )
-    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help=(
+            "Legacy square RGB and tactile Rectify size. Without this option, "
+            "RGB defaults to 640x480 and tactile Rectify to 256x256."
+        ),
+    )
+    parser.add_argument(
+        "--image-width", type=int, default=None,
+        help="Saved RGB width, default 640. Overrides --image-size for RGB.",
+    )
+    parser.add_argument(
+        "--image-height", type=int, default=None,
+        help="Saved RGB height, default 480. Overrides --image-size for RGB.",
+    )
     parser.add_argument("--gripper-force", type=float, default=4.0)
     parser.add_argument("--move-step", type=float, default=0.001)
     parser.add_argument("--rot-step", type=float, default=0.06)
@@ -554,6 +601,23 @@ def parse_args() -> argparse.Namespace:
         help="Alias for --no-collect-tactile.",
     )
     args = parser.parse_args()
+    square_image_size = args.image_size
+    if args.image_width is None:
+        args.image_width = square_image_size if square_image_size is not None else 640
+    if args.image_height is None:
+        args.image_height = square_image_size if square_image_size is not None else 480
+    if args.image_size is None:
+        args.image_size = 256
+    if args.image_width <= 0 or args.image_height <= 0:
+        parser.error("--image-width and --image-height must be positive.")
+    if args.fps <= 0:
+        parser.error("--fps must be positive.")
+    if not np.isfinite(args.recording_max_skew_ms) or not 0 < args.recording_max_skew_ms <= 50:
+        parser.error("--recording-max-skew-ms must be in (0, 50].")
+    if not np.isfinite(args.force_serial_timeout_s) or args.force_serial_timeout_s <= 0:
+        parser.error("--force-serial-timeout-s must be finite and positive.")
+    if not np.isfinite(args.force_max_age_s) or args.force_max_age_s <= 0:
+        parser.error("--force-max-age-s must be finite and positive.")
     if args.xense_depth_height is None:
         args.xense_depth_height = args.xense_force_height
     if args.xense_depth_width is None:
@@ -581,13 +645,38 @@ def make_dataset(args: argparse.Namespace) -> LeRobotDataset:
     root = Path(args.root)
     complete_dataset = (root / "meta").exists() and (root / "data").exists()
 
+    def load_for_recording() -> LeRobotDataset:
+        dataset = LeRobotDataset(args.repo_id, root=str(root))
+        if dataset.fps != args.fps:
+            raise ValueError(
+                f"Dataset {root} uses {dataset.fps} fps, but --fps={args.fps}. "
+                "Use a new --root for the new frame rate, or pass "
+                f"--fps {dataset.fps} to resume this dataset."
+            )
+        rgb_shape = (args.image_height, args.image_width, 3)
+        for key in ("observation.image", "observation.wrist_image"):
+            stored_shape = tuple(dataset.features[key]["shape"])
+            if stored_shape != rgb_shape:
+                raise ValueError(
+                    f"{key} in dataset {root} has shape {stored_shape}, but "
+                    f"the requested RGB shape is {rgb_shape}. Use a new --root "
+                    "or resume with the original --image-width and --image-height."
+                )
+        # Loading an existing dataset leaves image_writer=None. Match the
+        # asynchronous writer used for new datasets so PNG encoding stays
+        # outside the robot's collection loop when resuming.
+        dataset.image_writer = RecordingImageWriter(
+            compress_level=args.image_png_compress_level,
+        )
+        return dataset
+
     if args.overwrite and root.exists():
         confirm_and_rmtree(root, reason="--overwrite")
         complete_dataset = False
 
     if complete_dataset and args.resume:
         print(f"Load existing dataset from {root}")
-        return LeRobotDataset(args.repo_id, root=str(root))
+        return load_for_recording()
 
     if root.exists():
         if complete_dataset:
@@ -595,7 +684,7 @@ def make_dataset(args: argparse.Namespace) -> LeRobotDataset:
             ans = input("Overwrite it, continue saving, or quit? [o/c/q] ").strip().lower()
             if ans in ("c", "continue", "r", "resume"):
                 print(f"Load existing dataset from {root}")
-                return LeRobotDataset(args.repo_id, root=str(root))
+                return load_for_recording()
             if ans in ("o", "overwrite", "y", "yes"):
                 confirm_and_rmtree(root)
             else:
@@ -612,12 +701,12 @@ def make_dataset(args: argparse.Namespace) -> LeRobotDataset:
     features = {
         "observation.image": {
             "dtype": "image",
-            "shape": (args.image_size, args.image_size, 3),
+            "shape": (args.image_height, args.image_width, 3),
             "names": ["height", "width", "channels"],
         },
         "observation.wrist_image": {
             "dtype": "image",
-            "shape": (args.image_size, args.image_size, 3),
+            "shape": (args.image_height, args.image_width, 3),
             "names": ["height", "width", "channels"],
         },
         "observation.state": {
@@ -625,7 +714,6 @@ def make_dataset(args: argparse.Namespace) -> LeRobotDataset:
             "shape": (6,),
             "names": ["state"],
         },
-        # 保存每一帧的实际 TCP 位姿：[x, y, z, r, p, y]。
         "observation.fingertip_center_pose_relative_to_nut": {
             "dtype": "float32",
             "shape": (6,),
@@ -713,20 +801,27 @@ def make_dataset(args: argparse.Namespace) -> LeRobotDataset:
             "names": ["force_torque"],
         }
 
-    return LeRobotDataset.create(
+    dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         root=str(root),
         robot_type="ur5_rg2",
         fps=args.fps,
         features=features,
-        image_writer_threads=4,
-        image_writer_processes=2,
+        image_writer_threads=0,
+        image_writer_processes=0,
     )
+    dataset.image_writer = RecordingImageWriter(
+        compress_level=args.image_png_compress_level,
+    )
+    return dataset
 
 
-def resize_rgb(image: np.ndarray, image_size: int) -> np.ndarray:
-    image = Image.fromarray(image.astype(np.uint8))
-    image = image.resize((image_size, image_size))
+def resize_rgb(image: np.ndarray, image_size: int | tuple[int, int]) -> np.ndarray:
+    size = (image_size, image_size) if isinstance(image_size, int) else image_size
+    image = np.asarray(image, dtype=np.uint8)
+    if image.shape[:2] == (size[1], size[0]):
+        return image
+    image = Image.fromarray(image).resize(size)
     return np.asarray(image, dtype=np.uint8)
 
 
@@ -835,7 +930,7 @@ def parse_axis_order(value: str) -> np.ndarray:
 def resolve_force_safety_axis_mapping(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, str]:
     preset = args.force_safety_axis_preset
     if preset == "auto":
-        if args.force_source in ("modbus-serial", "modbus-tcp"):
+        if args.force_source in ("fts300-stream", "modbus-serial", "modbus-tcp"):
             preset = "fts300-tool"
         else:
             preset = "identity"
@@ -1024,7 +1119,22 @@ class ForceReader:
         self.source = args.force_source
         self._robot = robot
         self._modbus = None
-        if self.source == "modbus-serial":
+        self._background = None
+        self._max_age_s = args.force_max_age_s
+        self._recording_history = RecordingHistory("force sample", maxlen=32)
+        if self.source == "fts300-stream":
+            self._modbus = RobotiqFTS300Stream(
+                port=args.force_serial_port, slave_address=args.force_serial_slave_address,
+                baudrate=args.force_serial_baudrate, timeout_s=args.force_serial_timeout_s,
+                low_latency=args.force_serial_low_latency)
+            # Streaming begins immediately; drain it during dataset loading,
+            # interactive resume prompts and tare, before kernel buffers fill.
+            try:
+                self.start_background()
+            except BaseException:
+                self.close()
+                raise
+        elif self.source == "modbus-serial":
             self._modbus = RobotiqFTS300ModbusSerial(
                 port=args.force_serial_port,
                 slave_address=args.force_serial_slave_address,
@@ -1048,19 +1158,72 @@ class ForceReader:
                 timeout_s=args.force_modbus_timeout_s,
             )
 
+    def start_background(self) -> None:
+        # Modbus polling starts after tare; streaming must be drained from open.
+        # Never share the robot's ZMQ socket with this serial-only worker.
+        if self.source not in ("fts300-stream", "modbus-serial") or self._background is not None:
+            return
+        if self._modbus is None:
+            raise RuntimeError("Modbus force reader is not initialized")
+        self._background = AsyncForceReader(self._modbus, max_age_s=self._max_age_s)
+        self._background.wait_until_ready()
+        print(
+            "Serial force sampling runs in the background; "
+            f"max_sample_age={self._max_age_s:.3f}s"
+        )
+
     def read(self) -> np.ndarray:
-        if self.source in ("modbus-serial", "modbus-tcp"):
+        if self._background is not None:
+            return self._background.read()
+        started = time.time()
+        if self.source in ("fts300-stream", "modbus-serial", "modbus-tcp"):
             if self._modbus is None:
                 raise RuntimeError("Modbus force reader is not initialized")
-            return format_force_torque(self._modbus.read())
-        if self.source == "ur-rtde":
-            return format_force_torque(self._robot.get_tcp_force())
-        raise RuntimeError(f"Unsupported force source: {self.source}")
+            value = format_force_torque(self._modbus.read())
+        elif self.source == "ur-rtde":
+            value = format_force_torque(self._robot.get_tcp_force())
+        else:
+            raise RuntimeError(f"Unsupported force source: {self.source}")
+        received = time.time()
+        try:
+            self._recording_history.add((started+received)/2, value.copy(),
+                basis="host_query_midpoint", read_started_timestamp=started,
+                received_timestamp=received)
+        except RecordingAlignmentError:
+            # A host-clock adjustment invalidates history, not the latest wrench.
+            pass
+        return value
+
+    def read_for_recording(self, target_timestamp: float, max_skew_s: float):
+        if self._background is None:
+            return self._recording_history.nearest(target_timestamp, max_skew_s)
+        wall, mono = time.time(), time.monotonic()
+        sample = self._background.read_sample_at(mono+target_timestamp-wall, max_skew_s)
+        started = wall+sample.read_started_monotonic-mono
+        received = wall+sample.received_monotonic-mono
+        history = RecordingHistory("force sample estimate")
+        estimate = wall+sample.timestamp_monotonic-mono
+        history.add(estimate, sample.wrench,
+                    basis=sample.timing_basis, read_started_timestamp=started,
+                    received_timestamp=received, host_receive_sequence=sample.sequence,
+                    timing_note=sample.timing_note)
+        return history.nearest(target_timestamp, max_skew_s)
 
     def close(self) -> None:
+        if self._background is not None:
+            self._background.close()
+            self._background = None
+            self._modbus = None
+            return
         close = getattr(self._modbus, "close", None)
         if close is not None:
             close()
+        self._modbus = None
+
+    @property
+    def crc_errors(self):
+        parser = getattr(self._modbus, "parser", None)
+        return None if parser is None else int(parser.crc_errors)
 
 
 def calibrate_force_bias(force_reader: ForceReader, fps: int) -> np.ndarray:
@@ -1099,6 +1262,7 @@ def empty_tactile_frame(
         "rectify": np.zeros((rectify_height, rectify_width, 3), dtype=np.uint8),
         "timestamp": 0.0,
         "host_timestamp": 0.0,
+        "capture_timestamp": 0.0,
         "valid": False,
     }
 
@@ -1303,6 +1467,9 @@ def format_tactile_frame(
     formatted["host_timestamp"] = (
         _float_or_zero(frame.get("host_timestamp")) if formatted["valid"] else 0.0
     )
+    formatted["capture_timestamp"] = (
+        _float_or_zero(frame.get("capture_timestamp")) if formatted["valid"] else 0.0
+    )
     return formatted
 
 
@@ -1332,6 +1499,157 @@ def format_tactile_frame_from_args(
         args.xense_rectify_height,
         args.xense_rectify_width,
     )
+
+
+def read_tactile_sample_for_collection(client, args, cursor, target_timestamp=None):
+    """Read a snapshot without doing image conversion between sensor requests."""
+    reader = getattr(client, "read_for_recording", None)
+    if args.tactile_recording_buffer and callable(reader):
+        pair = reader(cursor) if target_timestamp is None else reader(cursor, target_timestamp=target_timestamp)
+        latest, selected = pair["latest"], pair["recording"]
+    else:
+        latest = selected = client.read()
+    return selected, latest, selected is not None
+
+
+def read_tactile_for_collection(client, args, cursor, target_timestamp=None):
+    selected, latest, available = read_tactile_sample_for_collection(
+        client, args, cursor, target_timestamp,
+    )
+    recorded = (
+        format_tactile_frame_from_args(selected, args)
+        if available else empty_tactile_frame_from_args(args)
+    )
+    return recorded, latest, available
+
+
+def read_tactile_pair_samples(left, right, args, cursors, max_skew_s=None,
+                             reference_timestamp=None):
+    left_sample, left_latest, left_available = read_tactile_sample_for_collection(
+        left, args, cursors[0], target_timestamp=reference_timestamp,
+    )
+    if right is None:
+        right_sample = None
+        right_latest = empty_tactile_frame_from_args(args)
+        right_available = True
+    else:
+        right_sample, right_latest, right_available = read_tactile_sample_for_collection(
+            right, args, cursors[1],
+            target_timestamp=(tactile_capture_key(left_sample)
+                              if max_skew_s is not None and left_available else None),
+        )
+        if max_skew_s is not None and left_available and right_available:
+            left_time = tactile_capture_key(left_sample)
+            right_time = tactile_capture_key(right_sample)
+            latest_left_time = tactile_capture_key(left_latest)
+            if (abs(right_time-left_time) > max_skew_s
+                and latest_left_time > left_time
+                and abs(right_time-latest_left_time) <= max_skew_s):
+                # The right node may already have retired the capture matching
+                # the older left frame. Try the newer left capture, with the
+                # same cursor/window; do not wait or increase the buffer.
+                candidate, left_latest, available = read_tactile_sample_for_collection(
+                    left, args, cursors[0], target_timestamp=right_time,
+                )
+                if available and abs(tactile_capture_key(candidate)-right_time) <= max_skew_s:
+                    left_sample = candidate
+    return [(left_sample, left_latest, left_available),
+            (right_sample, right_latest, right_available)]
+
+
+def read_tactile_pair_for_collection(left, right, args, cursors, max_skew_s=None):
+    samples = read_tactile_pair_samples(left, right, args, cursors, max_skew_s)
+    return [
+        (format_tactile_frame_from_args(sample, args) if sample is not None
+         else empty_tactile_frame_from_args(args), latest, available)
+        for sample, latest, available in samples
+    ]
+
+
+def read_older_tactile_pair_samples(left, right, args, cursors, before_timestamp):
+    """Try the other unused capture in the existing one-frame recording buffer."""
+    sample, latest, available = read_tactile_sample_for_collection(left, args, cursors[0])
+    if not available or tactile_capture_key(sample) >= before_timestamp:
+        return None
+    right_sample = read_tactile_sample_for_collection(
+        right, args, cursors[1], target_timestamp=tactile_capture_key(sample),
+    )
+    # Do not forward-select the newer left capture again: the full row using
+    # that reference has already failed. The caller validates every stream.
+    return [(sample, latest, available), right_sample]
+
+
+def tactile_capture_key(frame: dict) -> float:
+    return float(frame.get("capture_timestamp", 0.0) or frame["timestamp"])
+
+
+def choose_recording_samples(alignment, camera_frames, tactile_frames, tactile_cursors,
+                             force_reader=None, require_valid_tactile=True):
+    if tactile_frames is not None:
+        if any(frame is None for frame in tactile_frames):
+            raise RecordingSampleUnavailable("waiting for a new tactile capture")
+        if require_valid_tactile and not all(bool(frame["valid"]) for frame in tactile_frames):
+            raise RecordingAlignmentError("Tactile recording capture is invalid")
+        target = tactile_capture_key(tactile_frames[0])
+    else:
+        target = min(frame["capture_timestamp"] for frame in camera_frames)
+    cameras, state, command = alignment.choose(target)
+    streams = {name: timing_entry(sample.timestamp, target, **sample.timing)
+               for name, sample in zip(("base_rgb", "wrist_rgb", "robot_state"), [*cameras, state])}
+    if tactile_frames is not None:
+        for name, frame, cursor in zip(("left_tactile", "right_tactile"), tactile_frames, tactile_cursors):
+            captured = tactile_capture_key(frame)
+            if not np.isfinite(captured) or captured <= 0:
+                raise RecordingAlignmentError(f"{name} has no usable capture time")
+            if (abs(captured-target) > alignment.max_skew_s
+                or (cursor is not None and captured <= cursor)):
+                raise RecordingSampleUnavailable(f"{name} has no unused capture near reference")
+            streams[name] = timing_entry(captured, target, basis="xense_capture_time")
+    force = None
+    if force_reader is not None:
+        force = force_reader.read_for_recording(target, alignment.max_skew_s)
+        streams["force_torque"] = timing_entry(force.timestamp, target, **force.timing)
+    times = [stream["timestamp"] for stream in streams.values()]
+    timing = {"reference_timestamp": target, "streams": streams,
+              "max_reference_delta_ms": max(abs(value-target) for value in times)*1000,
+              "timestamp_span_ms": (max(times)-min(times))*1000,
+              "gripper_command_timestamp": command.timestamp}
+    return cameras, state, command, force, timing
+
+
+def save_episode_with_tactile_timing(dataset, rows: list[dict], sensor_rows=None,
+                                   performance=None) -> None:
+    dataset.save_episode()
+    if not rows and not sensor_rows and performance is None:
+        return
+    episode = dataset.meta.total_episodes - 1
+    notes = {
+        "tactile_timing": "Native Xense capture times. Safety uses latest values. Recorded host time is add_frame entry, not PNG write completion.",
+        "sensor_timing": "Saved observations matched to the reference capture time. RGB/tactile use SDK frame times; UR uses mapped controller time when available; force uses stream receipt estimates or query midpoint. Unknown minimum network delay and sensor internal delay remain. Control uses latest samples.",
+    }
+    for name, frames in [("tactile_timing", rows), ("sensor_timing", sensor_rows)]:
+        if not frames:
+            continue
+        directory = Path(dataset.root) / "meta" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"episode_{episode:06d}.json"
+        if path.exists():
+            raise RuntimeError(f"Refusing to overwrite timing metadata: {path}")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"episode_index": episode, "note": notes[name],
+                                         "frames": frames}), encoding="utf-8")
+        temporary.replace(path)
+    if performance is not None:
+        directory = Path(dataset.root) / "meta" / "recording_performance"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"episode_{episode:06d}.json"
+        if path.exists():
+            raise RuntimeError(f"Refusing to overwrite recording diagnostics: {path}")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"episode_index": episode,
+            "note": "Recording counters start with the first ready sample; preparation waiting is separate. Counts can differ on skipped iterations. recording_retry is inside alignment; tactile_retry_format is inside recording_retry. Training timestamp is unchanged.",
+            **performance}), encoding="utf-8")
+        temporary.replace(path)
 
 
 def tactile_wrench_is_safe(frame: dict[str, np.ndarray | float | bool]) -> bool:
@@ -1859,15 +2177,25 @@ class PreviewWindow:
 
 
 def main() -> None:
-    args = parse_args()
+    # Run every closer even if another close fails, including startup/tare errors.
+    with ExitStack() as cleanup:
+        _collect(parse_args(), cleanup)
+
+
+def _collect(args, cleanup: ExitStack) -> None:
+    rgb_size = (args.image_width, args.image_height)
 
     robot = ZMQClientRobot(
         port=args.robot_port,
         host=args.host,
         timeout_ms=args.robot_timeout_ms,
+        blocking_gripper=False,
     )
+    cleanup.callback(robot.close)
     base_camera = ZMQClientCamera(port=args.base_camera_port, host=args.host)
+    cleanup.callback(base_camera.close)
     wrist_camera = ZMQClientCamera(port=args.wrist_camera_port, host=args.host)
+    cleanup.callback(wrist_camera.close)
     force_reader = None
     left_tactile = None
     right_tactile = None
@@ -1877,11 +2205,13 @@ def main() -> None:
             host=args.host,
             timeout_ms=args.tactile_timeout_ms,
         )
+        cleanup.callback(left_tactile.close)
         right_tactile = ZMQClientTactile(
             port=args.right_tactile_port,
             host=args.host,
             timeout_ms=args.tactile_timeout_ms,
         )
+        cleanup.callback(right_tactile.close)
         print(
             "Using Xense tactile through ZMQ. Start launch_nodes.py with "
             "--tactile-source xense and the two Xense serial numbers."
@@ -1890,39 +2220,39 @@ def main() -> None:
     try:
         if args.collect_force:
             force_reader = ForceReader(args, robot)
+            cleanup.callback(force_reader.close)
 
         robot_dofs = robot.num_dofs()
         if robot_dofs != 7:
             raise RuntimeError(f"Expected UR5 + RG2 robot with 7 DoF, got {robot_dofs}.")
-        base_camera.read((args.image_size, args.image_size))
-        wrist_camera.read((args.image_size, args.image_size))
+        if args.recording_time_alignment:
+            base_camera.read_rgb_with_timestamp(rgb_size)
+            wrist_camera.read_rgb_with_timestamp(rgb_size)
+            if "observation_timestamp" not in robot.get_observations():
+                raise RuntimeError("Robot node has no state times; restart launch_nodes.py")
+        else:
+            base_camera.read_rgb(rgb_size)
+            wrist_camera.read_rgb(rgb_size)
         if left_tactile is not None and right_tactile is not None:
             format_tactile_frame_from_args(left_tactile.read(), args)
             format_tactile_frame_from_args(right_tactile.read(), args)
         if force_reader is not None:
             force_reader.read()
     except (ModuleNotFoundError, RuntimeError) as exc:
-        if force_reader is not None:
-            force_reader.close()
-        robot.close()
-        if left_tactile is not None:
-            left_tactile.close()
-        if right_tactile is not None:
-            right_tactile.close()
         raise RuntimeError(
             "Failed to connect to or warm up the robot/camera/tactile/force sources. "
             "Start them first with:\n"
             "  python launch_nodes.py --robot ur "
-            "--camera-width 424 --camera-height 240 --camera-fps 15 "
+            "--camera-width 640 --camera-height 480 --camera-fps 30 "
             "--tactile-source xense --xense-left-serial OG001783 "
             "--xense-right-serial OG001782\n"
             "If the servers are already running, check the camera serial numbers "
             "and RealSense USB/frame status. If tactile collection is enabled, "
             "also check xensesdk, USB permissions, Xense ZMQ ports, and the "
             "Xense serial numbers. "
-            "If force collection is enabled with --force-source modbus-serial, "
-            "check the FTS-300-S USB serial port, slave address, register address, "
-            "baudrate, and minimalmodbus/pyserial installation. If --force-source "
+            "For the default fts300-stream source, check the FT300-S USB serial "
+            "port, slave address, 19200 baud and pyserial installation. For "
+            "modbus-serial, also check the register address and minimalmodbus. If --force-source "
             "modbus-tcp is used, check IP, port, unit id, register address, "
             "function code, data format, and scale. If --force-source ur-rtde "
             "is used, check that the UR TCP force signal is available through RTDE.\n"
@@ -1930,11 +2260,16 @@ def main() -> None:
         ) from exc
 
     dataset = make_dataset(args)
+    cleanup.callback(dataset.stop_image_writer)
     store_tactile, store_force = validate_requested_sensor_features(dataset, args)
+    print(
+        f"RGB images will be saved with shape=({args.image_height}, "
+        f"{args.image_width}, 3), target_fps={args.fps}"
+    )
     if store_tactile:
         print(
             "Xense tactile will be saved as "
-            "observation.tactile_{left,right}.force/force6d/depth/rectify "
+            "observation.tactile_{left,right}.distributed_force/force6d/depth/rectify "
             f"with force_shape=({args.xense_force_height}, {args.xense_force_width}, 3), "
             f"depth_shape=({args.xense_depth_height}, {args.xense_depth_width}, 3), "
             f"rectify_shape=({args.xense_rectify_height}, {args.xense_rectify_width}, 3), "
@@ -1964,7 +2299,9 @@ def main() -> None:
             f"max_rot_correction={force_safety.max_correction[3:].tolist()} rad"
         )
     teleop = KeyboardTeleop()
+    cleanup.callback(teleop.close)
     preview = PreviewWindow(enabled=not args.no_preview)
+    cleanup.callback(preview.close)
 
     obj_init = np.zeros(9, dtype=np.float32)
     episode_id = 0
@@ -1973,17 +2310,23 @@ def main() -> None:
     force_print_frame = 0
     next_tick = time.time()
     reset_target_joints = None
-
-    # L 连续自动采集当前阶段：移动、闭合、等待保存、打开或请求下一次复位。
     reset_sequence_phase = None
-
-    # L 流程中夹爪闭合后，保存动作应当触发的时间。
     reset_close_wait_until = None
-
+    auto_record_pending = False
     reset_rotation_vector = RESET_TCP_ROTATION_VECTOR.copy()
     last_tactile_invalid_print = 0.0
     last_tactile_safety_print = 0.0
     last_tactile_wrench_print = 0.0
+    last_force_invalid_print = 0.0
+    last_gripper_status = None
+    tactile_cursors = [None, None]
+    tactile_timing = []
+    sensor_timing = []
+    performance = None
+    alignment = (RecordingTimeAlignment(args.recording_max_skew_ms/1000)
+                 if args.recording_time_alignment else None)
+    last_alignment_print = 0.0
+    last_tactile_buffer_print = 0.0
 
     print("Keyboard teleop controls:")
     print("  W/S/A/D/R/F: translate TCP")
@@ -1997,6 +2340,8 @@ def main() -> None:
     print("  SPACE: toggle RG2, Z: clear current episode, ENTER: save episode, ESC: exit")
 
     try:
+        if store_force and force_reader is not None:
+            force_reader.start_background()
         while episode_id < args.num_episodes:
             now = time.time()
             if now < next_tick:
@@ -2004,40 +2349,65 @@ def main() -> None:
                 continue
             next_tick = now + period
 
+            loop_started = time.monotonic()
+            robot_read_started = time.perf_counter()
             tcp_pose = robot.get_tcp_pose()
             # print(
             #     "TCP position "
             #     f"[x,y,z]=[{tcp_pose[0]: .4f}, {tcp_pose[1]: .4f}, {tcp_pose[2]: .4f}]"
             # )
             obs_before = robot.get_observations()
+            robot_read_finished = time.perf_counter()
+            alignment_error = None
+            if alignment is not None:
+                try:
+                    alignment.add_state(obs_before)
+                except RecordingAlignmentError as exc:
+                    alignment_error = exc
             current_joints = np.asarray(obs_before["joint_positions"], dtype=np.float32)
+            gripper_busy = bool(obs_before.get("gripper_busy", False))
+            gripper_error = obs_before.get("gripper_error")
+            gripper_status = (gripper_busy, gripper_error)
+            if gripper_status != last_gripper_status:
+                if gripper_error:
+                    print(f"RG2 error; arm commands disabled: {gripper_error}")
+                elif gripper_busy:
+                    print("RG2 executing; recording continues, arm commands paused")
+                elif last_gripper_status is not None:
+                    print("RG2 ready; arm commands enabled")
+                last_gripper_status = gripper_status
 
+            tactile_read_started = time.perf_counter()
             tactile_read_error = None
             if not store_tactile or left_tactile is None:
                 left_tactile_frame = empty_tactile_frame_from_args(args)
                 right_tactile_frame = empty_tactile_frame_from_args(args)
+                left_tactile_latest = left_tactile_frame
+                right_tactile_latest = right_tactile_frame
+                tactile_recording_available = True
             else:
                 try:
-                    left_tactile_frame = format_tactile_frame_from_args(
-                        left_tactile.read(),
-                        args,
+                    ((left_tactile_frame, left_tactile_latest, left_available),
+                     (right_tactile_frame, right_tactile_latest, right_available)) = read_tactile_pair_for_collection(
+                        left_tactile, right_tactile, args,
+                        tactile_cursors if recording else [None, None],
+                        max_skew_s=(alignment.max_skew_s if alignment is not None and recording else None),
                     )
-                    if right_tactile is None:
-                        right_tactile_frame = empty_tactile_frame_from_args(args)
-                    else:
-                        right_tactile_frame = format_tactile_frame_from_args(
-                            right_tactile.read(),
-                            args,
-                        )
+                    tactile_recording_available = left_available and right_available
                 except RuntimeError as exc:
                     tactile_read_error = exc
                     left_tactile_frame = empty_tactile_frame_from_args(args)
                     right_tactile_frame = empty_tactile_frame_from_args(args)
+                    left_tactile_latest = left_tactile_frame
+                    right_tactile_latest = right_tactile_frame
+                    tactile_recording_available = False
 
-            left_tactile_valid = bool(left_tactile_frame["valid"])
-            right_tactile_valid = bool(right_tactile_frame["valid"])
-            left_wrench = format_force_torque(left_tactile_frame["force6d"])
-            right_wrench = format_force_torque(right_tactile_frame["force6d"])
+            tactile_read_finished = time.perf_counter()
+
+            left_tactile_valid = bool(left_tactile_latest["valid"])
+            right_tactile_valid = bool(right_tactile_latest["valid"])
+            left_wrench = format_force_torque(left_tactile_latest["force6d"])
+            right_wrench = format_force_torque(right_tactile_latest["force6d"])
 
             tactile_safety_active = bool(
                 args.collect_tactile
@@ -2048,8 +2418,8 @@ def main() -> None:
                     or right_tactile is None
                     or not left_tactile_valid
                     or not right_tactile_valid
-                    or not tactile_wrench_is_safe(left_tactile_frame)
-                    or not tactile_wrench_is_safe(right_tactile_frame)
+                    or not tactile_wrench_is_safe(left_tactile_latest)
+                    or not tactile_wrench_is_safe(right_tactile_latest)
                 )
             )
 
@@ -2073,13 +2443,28 @@ def main() -> None:
                         f"left={np.array2string(left_wrench, precision=1)}, "
                         f"right={np.array2string(right_wrench, precision=2)}"
                     )
+                # print(tcp_pose)
+
                 last_tactile_wrench_print = now
 
             dpos, drot, gripper, has_motion, event = teleop.poll(args)
 
-            # 标记当前帧的 done 是否由 L 自动流程触发，避免影响手动 ENTER。
-            auto_cycle_done = False
-            save_auto_frame = False
+            if gripper_busy or gripper_error:
+                # Do not queue arm targets behind the custom script: each new
+                # movement must be computed from a fresh pose once it is done.
+                if gripper_error:
+                    reset_target_joints = None
+                    reset_sequence_phase = None
+                    reset_close_wait_until = None
+                    auto_record_pending = False
+                teleop.screw_direction = 0
+                dpos = np.zeros(3, dtype=np.float64)
+                drot = np.eye(3)
+                has_motion = False
+                if event in ("random_reset_pose", "reset_tcp_orientation"):
+                    event = None
+                if force_safety is not None:
+                    force_safety.reset()
 
             if tactile_safety_active:
                 now = time.time()
@@ -2091,12 +2476,12 @@ def main() -> None:
                         reasons.append("left_valid=False")
                     if not right_tactile_valid:
                         reasons.append("right_valid=False")
-                    if left_tactile_valid and not tactile_wrench_is_safe(left_tactile_frame):
+                    if left_tactile_valid and not tactile_wrench_is_safe(left_tactile_latest):
                         reasons.append("left_wrench_over_limit")
-                    if right_tactile_valid and not tactile_wrench_is_safe(right_tactile_frame):
+                    if right_tactile_valid and not tactile_wrench_is_safe(right_tactile_latest):
                         reasons.append("right_wrench_over_limit")
                     print(
-                        "Tactile safety triggered: keyboard input disabled and gripper opened. "
+                        "Tactile safety triggered: keyboard input disabled and gripper open requested. "
                         f"reason={','.join(reasons) or 'xense_source_unavailable'}; "
                         f"left={np.array2string(left_wrench, precision=3)}, "
                         f"right={np.array2string(right_wrench, precision=3)}"
@@ -2106,22 +2491,30 @@ def main() -> None:
                 teleop.gripper_closed = False
                 teleop.screw_direction = 0
                 reset_target_joints = None
-                # Xense 触觉安全触发时，中止整个 L 自动流程并清除计时状态。
                 reset_sequence_phase = None
                 reset_close_wait_until = None
-                # 停止录制
+                auto_record_pending = False
                 recording = False
                 frames_in_episode = 0
-                save_auto_frame = False
                 reset_episode_buffer(dataset)
+                tactile_cursors = [None, None]
+                tactile_timing = []
+                sensor_timing = []
+                performance = None
+                if alignment is not None:
+                    alignment.reset()
                 dpos = np.zeros(3, dtype=np.float64)
                 drot = np.eye(3)
                 gripper = 0.0
                 has_motion = False
                 if event != "quit":
                     event = None
-                if not args.no_command:
-                    robot.command_gripper(0.0, force=args.gripper_force)
+                if not args.no_command and not gripper_error:
+                    try:
+                        robot.command_gripper(0.0, force=args.gripper_force)
+                    except RuntimeError as exc:
+                        gripper_error = str(exc)
+                        print(f"RG2 open request failed: {exc}")
 
             # 夹爪已打开后，在下一控制帧自动生成一次 L 随机复位事件。
             if reset_sequence_phase == "request_reset":
@@ -2145,7 +2538,7 @@ def main() -> None:
                 if event is not None:
                     # 手动事件可以中止后续自动循环。
                     reset_sequence_phase = None
-                elif abs(float(current_joints[-1])) <= 0.03:
+                elif not gripper_busy and not gripper_error and abs(float(current_joints[-1])) <= 0.03:
                     # 确认夹爪实际打开后，才创建并录制下一条 episode。
                     reset_episode_buffer(dataset)
                     # 移动过程中不保存
@@ -2172,7 +2565,7 @@ def main() -> None:
                     reset_sequence_phase = None
                     reset_close_wait_until = None
                 elif reset_sequence_phase == "closing":
-                    if abs(float(current_joints[-1]) - 1.0) <= 0.03:
+                    if not gripper_busy and not gripper_error and abs(float(current_joints[-1]) - 1.0) <= 0.03:
                         # 从确认夹爪闭合的时刻开始计时，等待期间仍持续采集数据。
                         reset_close_wait_until = (
                             time.monotonic() + AUTO_RESET_CLOSE_WAIT_SECONDS
@@ -2192,69 +2585,94 @@ def main() -> None:
                     reset_episode_buffer(dataset)
                     frames_in_episode = 0
                     recording = True
-                    save_auto_frame = True
+                    auto_record_pending = True
+                    tactile_cursors = [None, None]
+                    tactile_timing = []
+                    sensor_timing = []
+                    performance = RecordingPerformance(args.fps,
+                        force_reader.crc_errors if force_reader is not None else None,
+                        preparing=alignment is not None)
+                    if alignment is not None:
+                        alignment.reset()
 
             if event == "reset":
                 reset_target_joints = None
-                # 手动清空 episode 时同时终止 L 自动流程。
                 reset_sequence_phase = None
                 reset_close_wait_until = None
+                auto_record_pending = False
                 reset_episode_buffer(dataset)
                 if force_safety is not None:
                     force_safety.reset()
                 recording = False
                 frames_in_episode = 0
+                tactile_cursors = [None, None]
+                tactile_timing = []
+                sensor_timing = []
+                performance = None
+                if alignment is not None:
+                    alignment.reset()
                 print("Reset current episode buffer")
                 continue
             if event == "done":
                 reset_target_joints = None
-                # 保存前清除当前 L 阶段，后面根据保存结果决定是否进入 opening。
                 reset_sequence_phase = None
                 reset_close_wait_until = None
-
-                # 记录当前 episode 是否确实包含数据并成功调用保存。
-                episode_saved = False
+                auto_record_pending = False
                 if recording and frames_in_episode > 0:
-                    dataset.save_episode()
+                    save_episode_with_tactile_timing(dataset, tactile_timing, sensor_timing,
+                        performance.summary(force_reader.crc_errors if force_reader is not None else None))
                     print(f"Saved episode {episode_id} ({frames_in_episode} frames)")
                     episode_id += 1
-                    episode_saved = True
                 if force_safety is not None:
                     force_safety.reset()
                 recording = False
                 frames_in_episode = 0
-
-                # 只有 L 自动生成的 done 才执行“打开并进入下一轮”；手动 ENTER 不变。
-                if auto_cycle_done:
-                    teleop.gripper_closed = False
-                    if not args.no_command:
-                        robot.command_gripper(0.0, force=args.gripper_force)
-                    print("自动保存完成，等待夹爪打开")
-
-                    if episode_saved and episode_id < args.num_episodes:
-                        # 下一帧进入 opening，确认实际打开后再开始下一条 episode。
-                        reset_sequence_phase = "opening"
-                    elif not episode_saved:
-                        print("自动流程结束：当前没有可以保存的数据帧")
+                tactile_cursors = [None, None]
+                tactile_timing = []
+                sensor_timing = []
+                performance = None
+                if alignment is not None:
+                    alignment.reset()
                 continue
-            # 按 P 后立即开始录制，不等待运动指令。
+            # P arms collection without requiring motion. Aligned recording
+            # starts only after a complete valid row is ready.
             if event == "start":
                 if not recording:
                     recording = True
+                    performance = RecordingPerformance(args.fps,
+                        force_reader.crc_errors if force_reader is not None else None,
+                        preparing=alignment is not None)
                     frames_in_episode = 0
                     reset_episode_buffer(dataset)
+                    if alignment is not None:
+                        alignment.reset()
                     if force_safety is not None:
                         force_safety.reset()
-                    print(f"Start recording episode {episode_id}")
+                    if alignment is not None:
+                        print(
+                            f"Preparing recording episode {episode_id}: warming up histories; "
+                            "wait for 'Recording ready' before starting the task"
+                        )
+                    else:
+                        print(f"Start recording episode {episode_id}")
             if event == "quit":
                 reset_target_joints = None
-                # 退出程序时清除 L 自动流程状态。
                 reset_sequence_phase = None
                 reset_close_wait_until = None
+                auto_record_pending = False
                 if recording and frames_in_episode > 0:
-                    dataset.save_episode()
+                    save_episode_with_tactile_timing(dataset, tactile_timing, sensor_timing,
+                        performance.summary(force_reader.crc_errors if force_reader is not None else None))
                     print(f"Saved episode {episode_id} before exit ({frames_in_episode} frames)")
                 break
+
+            if recording:
+                performance.start_loop(loop_started)
+                performance.duration("robot_reads_before", robot_read_started, robot_read_finished)
+                performance.duration("tactile_read_and_format", tactile_read_started, tactile_read_finished)
+                performance.conditions["gripper_busy"] += int(gripper_busy)
+                performance.conditions["gripper_error"] += int(bool(gripper_error))
+                performance.conditions["tactile_safety"] += int(tactile_safety_active)
 
             if event == "capture_reset_orientation":
                 reset_rotation_vector = np.asarray(tcp_pose[3:6], dtype=np.float64).copy()
@@ -2263,6 +2681,8 @@ def main() -> None:
                     f"[rx,ry,rz]=[{reset_rotation_vector[0]: .6f}, "
                     f"{reset_rotation_vector[1]: .6f}, {reset_rotation_vector[2]: .6f}]"
                 )
+                if recording:
+                    performance.skips["capture_reset_orientation"] += 1
                 continue
 
             if event == "random_reset_pose":
@@ -2292,6 +2712,8 @@ def main() -> None:
                         "Reset IK failed. Restart launch_nodes.py so the robot "
                         f"server exposes inverse_kinematics. Error: {exc}"
                     )
+                    if recording:
+                        performance.skips["reset_ik_failed"] += 1
                     continue
                 if force_safety is not None:
                     force_safety.reset()
@@ -2307,9 +2729,9 @@ def main() -> None:
             reset_orientation_rotvec = None
             if reset_orientation_requested:
                 reset_target_joints = None
-                # M 姿态复位与 L 自动流程互斥。
                 reset_sequence_phase = None
                 reset_close_wait_until = None
+                auto_record_pending = False
                 if force_safety is not None:
                     force_safety.reset()
                 reset_orientation_rotvec = vertical_reset_rotvec_preserving_heading(
@@ -2396,18 +2818,34 @@ def main() -> None:
                 else:
                     target_tcp = apply_tcp_delta(tcp_pose, dpos, drot)
 
+            stage_started = time.perf_counter()
             force_torque = np.zeros(6, dtype=np.float32)
             if store_force and force_reader is not None:
                 try:
                     raw_force_torque = force_reader.read()
                     force_torque = (raw_force_torque - force_bias).astype(np.float32)
                 except RuntimeError as exc:
-                    print(f"Force/torque frame skipped: {exc}")
+                    reset_target_joints = None
+                    reset_sequence_phase = None
+                    reset_close_wait_until = None
+                    auto_record_pending = False
+                    teleop.screw_direction = 0
+                    if force_safety is not None:
+                        force_safety.reset()
+                    now = time.monotonic()
+                    if now - last_force_invalid_print > 1.0:
+                        print(f"Force/torque unavailable; commands and frame skipped: {exc}")
+                        last_force_invalid_print = now
+                    if recording:
+                        performance.skips["force_unavailable"] += 1
+                        performance.duration("force_read", stage_started)
                     continue
                 print_every = max(1, int(args.force_print_every))
                 if force_print_frame % print_every == 0:
                     print_force_torque(force_torque)
                 force_print_frame += 1
+            if recording:
+                performance.duration("force_read", stage_started)
 
             safety_active = False
             safety_hard_stop = False
@@ -2427,6 +2865,10 @@ def main() -> None:
                         f"rot_corr_rad={np.array2string(safety_correction[3:], precision=5)}"
                     )
 
+            if recording:
+                performance.conditions["force_safety_correction"] += int(safety_active)
+                performance.conditions["force_hard_stop"] += int(safety_hard_stop)
+
             if (
                 reset_pose_requested
                 or has_motion
@@ -2434,29 +2876,73 @@ def main() -> None:
                 or abs(float(current_joints[-1]) - gripper) > 0.03
             ):
                 if not args.no_command:
-                    if reset_pose_requested:
-                        robot.command_joint_state(target_joints)
-                    elif has_motion or safety_active:
-                        robot.command_tcp_pose(target_tcp)
-                    if not safety_hard_stop:
-                        robot.command_gripper(gripper, force=args.gripper_force)
+                    stage_started = time.perf_counter()
+                    try:
+                        if reset_pose_requested and not gripper_busy and not gripper_error:
+                            robot.command_joint_state(target_joints)
+                        elif (has_motion or safety_active) and not gripper_busy and not gripper_error:
+                            robot.command_tcp_pose(target_tcp)
+                        if not safety_hard_stop and not gripper_error:
+                            robot.command_gripper(gripper, force=args.gripper_force)
+                    except RuntimeError as exc:
+                        # A worker failure can arrive after obs_before. Preserve
+                        # recording for that case, but surface other robot errors.
+                        if not robot.get_observations().get("gripper_error"):
+                            raise
+                        reset_target_joints = None
+                        teleop.screw_direction = 0
+                        if force_safety is not None:
+                            force_safety.reset()
+                        print(f"RG2 failed; arm commands disabled: {exc}")
+                    finally:
+                        if recording:
+                            performance.duration("robot_commands", stage_started)
+
+            if alignment is not None:
+                try:
+                    recorded_command = float(current_joints[-1]) if safety_hard_stop else float(gripper)
+                    alignment.actions.add(time.time(), recorded_command, basis="requested_gripper_command")
+                except RecordingAlignmentError as exc:
+                    alignment_error = exc
 
             if not recording and not preview.enabled:
                 continue
 
+            stage_started = time.perf_counter()
             try:
-                base_image, _ = base_camera.read((args.image_size, args.image_size))
-                wrist_image, _ = wrist_camera.read((args.image_size, args.image_size))
+                if alignment is not None:
+                    camera_frames = [base_camera.read_rgb_with_timestamp(rgb_size),
+                                     wrist_camera.read_rgb_with_timestamp(rgb_size)]
+                    base_image, wrist_image = [value["image"] for value in camera_frames]
+                    for index, value in enumerate(camera_frames):
+                        alignment.add_camera(index, value)
+                else:
+                    base_image = base_camera.read_rgb(rgb_size)
+                    wrist_image = wrist_camera.read_rgb(rgb_size)
             except RuntimeError as exc:
                 print(f"Camera frame skipped: {exc}")
+                if recording:
+                    performance.skips["camera_read_failed"] += 1
                 continue
-            base_image = resize_rgb(base_image, args.image_size)
-            wrist_image = resize_rgb(wrist_image, args.image_size)
+            finally:
+                if recording:
+                    performance.duration("camera_read", stage_started)
+            base_image = resize_rgb(base_image, rgb_size)
+            wrist_image = resize_rgb(wrist_image, rgb_size)
 
             if args.collect_tactile and store_tactile and tactile_read_error is not None:
                 print(f"Tactile frame skipped: {tactile_read_error}")
+                if recording:
+                    performance.skips["tactile_read_failed"] += 1
                 continue
-            if args.collect_tactile and store_tactile and args.require_valid_tactile and (
+            if recording and store_tactile and not tactile_recording_available and alignment is None:
+                now = time.monotonic()
+                if now - last_tactile_buffer_print > 1.0:
+                    print("Recording frame skipped: waiting for a new tactile capture; control uses latest values")
+                    last_tactile_buffer_print = now
+                performance.skips["no_new_tactile_capture"] += 1
+                continue
+            if args.collect_tactile and store_tactile and tactile_recording_available and args.require_valid_tactile and (
                 not bool(left_tactile_frame["valid"])
                 or not bool(right_tactile_frame["valid"])
             ):
@@ -2474,28 +2960,27 @@ def main() -> None:
                         "USB permissions, and both Xense serial numbers before recording."
                     )
                     last_tactile_invalid_print = now
+                if recording:
+                    performance.skips["invalid_tactile_capture"] += 1
                 continue
 
+            stage_started = time.perf_counter()
             obs_after = robot.get_observations()
-            # 保存执行本帧命令后的实际 TCP 位姿，与 _L.py 的数据内容保持一致。
-            tcp_pose_after_rotvec = np.asarray(
-                robot.get_tcp_pose(),
-                dtype=np.float32,
-            )
-            # tcp_pose_after_rpy = tcp_pose_rotvec_to_rpy(
-            #     tcp_pose_after_rotvec
-            # )
-            tcp_pose_after_relative_rpy = (
-            tcp_pose_relative_to_reference_rpy(
-                tcp_pose_after_rotvec,
-                CALIBRATED_TCP_POSE_BASE,
-            )
-        )
+            if recording:
+                performance.duration("robot_read_after", stage_started)
+            if alignment is not None:
+                try:
+                    alignment.add_state(obs_after)
+                except RecordingAlignmentError as exc:
+                    alignment_error = exc
+            tcp_pose_after = obs_after.get("tcp_pose")
+            if tcp_pose_after is None:
+                tcp_pose_after = robot.get_tcp_pose()
             state = np.asarray(obs_after["joint_positions"], dtype=np.float32)
             action = state.copy()
             action[-1] = float(state[-1]) if safety_hard_stop else gripper
 
-            # 录制可以由 P 手动开始，也会在按 L 或进入下一轮自动复位时开始。
+            # P records a sequence; the original L cycle saves one aligned row.
 
             # if not recording and (
             #     has_motion
@@ -2508,12 +2993,125 @@ def main() -> None:
             #     print(f"Start recording episode {episode_id}")
 
             if recording:
+                record_base_image, record_wrist_image = base_image, wrist_image
+                record_force_torque = force_torque
+                record_tcp_pose = tcp_pose_after
+                timing = None
+                selected_cameras = None
+                stage_started = time.perf_counter()
+                if alignment is not None:
+                    try:
+                        if alignment_error is not None:
+                            raise alignment_error
+                        try:
+                            selected_cameras, selected_state, selected_command, saved_force, timing = choose_recording_samples(
+                                alignment, camera_frames,
+                                [left_tactile_frame if left_available else None,
+                                 right_tactile_frame if right_available else None] if store_tactile else None,
+                                tactile_cursors, force_reader if store_force else None, args.require_valid_tactile,
+                            )
+                        except RecordingSampleUnavailable:
+                            if (not store_tactile or left_tactile is None or right_tactile is None
+                                or tactile_capture_key(left_tactile_latest) < alignment.started_at):
+                                raise
+                            # Commands/protection already used the beginning-of-loop
+                            # snapshot. Retry recording without waiting for a
+                            # future capture or advancing any saved cursor.
+                            performance.retries["attempts"] += 1
+                            retry_started = time.perf_counter()
+                            formatted_pair = [left_tactile_frame, right_tactile_frame]
+                            older_candidate_attempted = False
+                            older_candidate_used = False
+                            try:
+                                ((left_tactile_frame, left_tactile_latest, left_available),
+                                 (right_tactile_frame, right_tactile_latest, right_available)) = read_tactile_pair_samples(
+                                    left_tactile, right_tactile, args, tactile_cursors,
+                                    max_skew_s=alignment.max_skew_s, reference_timestamp=time.time(),
+                                )
+                                try:
+                                    selected_cameras, selected_state, selected_command, saved_force, timing = choose_recording_samples(
+                                        alignment, camera_frames, [left_tactile_frame, right_tactile_frame],
+                                        tactile_cursors, force_reader if store_force else None, args.require_valid_tactile,
+                                    )
+                                except RecordingSampleUnavailable:
+                                    if (not args.tactile_recording_buffer
+                                        or left_tactile_frame is None or right_tactile_frame is None
+                                        or tactile_capture_key(left_tactile_frame) < alignment.started_at):
+                                        raise
+                                    older_candidate_attempted = True
+                                    performance.retries["older_candidate_attempts"] += 1
+                                    candidate_pair = read_older_tactile_pair_samples(
+                                        left_tactile, right_tactile, args, tactile_cursors,
+                                        before_timestamp=tactile_capture_key(left_tactile_frame),
+                                    )
+                                    if candidate_pair is None:
+                                        raise
+                                    ((left_tactile_frame, left_tactile_latest, left_available),
+                                     (right_tactile_frame, right_tactile_latest, right_available)) = candidate_pair
+                                    selected_cameras, selected_state, selected_command, saved_force, timing = choose_recording_samples(
+                                        alignment, camera_frames, [left_tactile_frame, right_tactile_frame],
+                                        tactile_cursors, force_reader if store_force else None, args.require_valid_tactile,
+                                    )
+                                    older_candidate_used = True
+                                format_started = time.perf_counter()
+                                try:
+                                    # Only newly selected captures need resizing.
+                                    left_tactile_frame, right_tactile_frame = [
+                                        cached if tactile_capture_key(cached) == tactile_capture_key(sample)
+                                        else format_tactile_frame_from_args(sample, args)
+                                        for cached, sample in zip(formatted_pair, [left_tactile_frame, right_tactile_frame])
+                                    ]
+                                    if any(tactile_capture_key(frame) <= 0 for frame in
+                                           [left_tactile_frame, right_tactile_frame]) or (
+                                        args.require_valid_tactile and not all(
+                                            bool(frame["valid"]) for frame in [left_tactile_frame, right_tactile_frame]
+                                        )
+                                    ):
+                                        raise RecordingAlignmentError("Tactile recording capture is invalid")
+                                finally:
+                                    performance.duration("tactile_retry_format", format_started)
+                            except RuntimeError:
+                                performance.retries["failed"] += 1
+                                if older_candidate_attempted:
+                                    performance.retries["older_candidate_failed"] += 1
+                                raise
+                            else:
+                                performance.retries["recovered"] += 1
+                                timing["recording_retry_used"] = True
+                                if older_candidate_used:
+                                    performance.retries["older_candidate_recovered"] += 1
+                                    timing["recording_older_candidate_used"] = True
+                            finally:
+                                performance.duration("recording_retry", retry_started)
+                        if saved_force is not None:
+                            record_force_torque = (saved_force.value-force_bias).astype(np.float32)
+                        record_base_image, record_wrist_image = [sample.value for sample in selected_cameras]
+                        record_tcp_pose = selected_state.timing.get("tcp_pose")
+                        if record_tcp_pose is None:
+                            raise RecordingAlignmentError("Robot node has no matching TCP pose; restart launch_nodes.py")
+                        state = selected_state.value
+                        action = state.copy()
+                        action[-1] = selected_command.value
+                    except RuntimeError as exc:
+                        now = time.monotonic()
+                        initial_warmup = (
+                            frames_in_episode == 0 and isinstance(exc, RecordingWarmup)
+                            and 0 <= time.time()-alignment.started_at <= 0.5
+                        )
+                        if not initial_warmup and now-last_alignment_print > 1.0:
+                            print(f"Recording alignment skipped a frame: {exc}")
+                            last_alignment_print = now
+                        performance.skips[f"alignment: {exc}"] += 1
+                        performance.duration("alignment", stage_started)
+                        continue
+                performance.duration("alignment", stage_started)
                 frame = {
-                    "observation.image": base_image,
-                    "observation.wrist_image": wrist_image,
+                    "observation.image": record_base_image,
+                    "observation.wrist_image": record_wrist_image,
                     "observation.state": state[:6].astype(np.float32),
-                    # 每一帧记录实际 TCP 的位置和旋转向量。
-                    "observation.fingertip_center_pose_relative_to_nut": tcp_pose_after_relative_rpy,
+                    "observation.fingertip_center_pose_relative_to_nut": (
+                        tcp_pose_relative_to_reference_rpy(record_tcp_pose, CALIBRATED_TCP_POSE_BASE)
+                    ),
                     "action": action.astype(np.float32),
                     "obj_init": obj_init,
                 }
@@ -2557,48 +3155,64 @@ def main() -> None:
                         }
                     )
                 if store_force:
-                    frame[FORCE_TORQUE_KEY] = force_torque
+                    frame[FORCE_TORQUE_KEY] = record_force_torque
 
+                if performance.preparing:
+                    performance.mark_ready(force_reader.crc_errors if force_reader is not None else None)
+                    print(f"Recording ready for episode {episode_id}; recording starts now")
+                recorded_monotonic = time.monotonic()
+                recorded_host_time = time.time()
+                stage_started = time.perf_counter()
                 dataset.add_frame(frame, task=args.task)
+                performance.duration("add_frame", stage_started)
+                performance.saved_rows += 1
+                if timing is not None:
+                    alignment.commit(selected_cameras)
+                    sensor_timing.append({"frame_index": frames_in_episode,
+                        "recorded_host_timestamp": recorded_host_time,
+                        "recorded_monotonic": recorded_monotonic, **timing})
+                if store_tactile:
+                    selected = [left_tactile_frame, right_tactile_frame]
+                    tactile_cursors = [tactile_capture_key(value) for value in selected]
+                    capture_times = [float(value.get("capture_timestamp", 0.0)) for value in selected]
+                    if all(value > 0 for value in capture_times):
+                        tactile_timing.append({
+                            "frame_index": frames_in_episode,
+                            "recorded_host_timestamp": recorded_host_time,
+                            "recorded_monotonic": recorded_monotonic,
+                            "capture_timestamp": capture_times,
+                            "latest_capture_timestamp": [
+                                float(left_tactile_latest.get("capture_timestamp", 0.0)),
+                                float(right_tactile_latest.get("capture_timestamp", 0.0)),
+                            ],
+                        })
                 frames_in_episode += 1
-                if save_auto_frame:
-                    dataset.save_episode()
-                    print(
-                        f"Saved episode {episode_id} "
-                        f"({frames_in_episode} frame)"
-                    )
+                if auto_record_pending:
+                    save_episode_with_tactile_timing(dataset, tactile_timing, sensor_timing,
+                        performance.summary(force_reader.crc_errors if force_reader is not None else None))
+                    print(f"Saved episode {episode_id} ({frames_in_episode} frame)")
                     episode_id += 1
-
                     recording = False
                     frames_in_episode = 0
-
+                    auto_record_pending = False
+                    tactile_cursors = [None, None]
+                    tactile_timing = []
+                    sensor_timing = []
+                    performance = None
+                    if alignment is not None:
+                        alignment.reset()
                     if force_safety is not None:
                         force_safety.reset()
-
-                    # 保存后打开夹爪。
                     teleop.gripper_closed = False
-                    if not args.no_command:
-                        robot.command_gripper(
-                            0.0,
-                            force=args.gripper_force,
-                        )
-
+                    if not args.no_command and not gripper_error:
+                        robot.command_gripper(0.0, force=args.gripper_force)
                     print("自动保存完成，等待夹爪打开")
-
                     if episode_id < args.num_episodes:
                         reset_sequence_phase = "opening"
 
             preview.show(base_image, wrist_image)
     finally:
-        preview.close()
-        teleop.close()
-        if force_reader is not None:
-            force_reader.close()
-        robot.close()
-        if left_tactile is not None:
-            left_tactile.close()
-        if right_tactile is not None:
-            right_tactile.close()
+        cleanup.close()
 
 
 if __name__ == "__main__":

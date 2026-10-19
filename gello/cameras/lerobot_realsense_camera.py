@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+import time
 
 import numpy as np
 from PIL import Image
@@ -47,15 +48,43 @@ class LeRobotRealSenseCamera(CameraDriver):
         self,
         img_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        image = self._camera.read()
+        frame = self.read_with_timestamp(img_size)
+        return frame["image"], frame["depth"]
+
+    def read_rgb(self, img_size=None) -> np.ndarray:
+        return self.read_rgb_with_timestamp(img_size)["image"]
+
+    def read_rgb_with_timestamp(self, img_size=None) -> dict:
+        return self.read_with_timestamp(img_size, include_depth=False)
+
+    def read_with_timestamp(self, img_size=None, *, include_depth=True) -> dict:
+        """Keep the native time of the exact color frame returned to the caller."""
+        if not self._camera.is_connected:
+            raise RuntimeError(f"{self} is disconnected")
+        okay, frames = self._camera.rs_pipeline.try_wait_for_frames(timeout_ms=200)
+        if not okay or frames is None:
+            raise RuntimeError(f"{self} did not deliver a color frame")
+        color = frames.get_color_frame()
+        if not color:
+            raise RuntimeError(f"{self} returned an incomplete color frame")
+        capture_timestamp = color.get_timestamp()/1000.0
+        timestamp_domain = str(color.get_frame_timestamp_domain())
+        host_timestamp = time.time()
+        image = self._camera._postprocess_image(np.asanyarray(color.get_data()))
         image = np.asarray(image, dtype=np.uint8)
 
         if img_size is not None and image.shape[:2] != (img_size[1], img_size[0]):
             image = np.asarray(Image.fromarray(image).resize(img_size), dtype=np.uint8)
 
-        depth = np.zeros(image.shape[:2] + (1,), dtype=np.uint16)
+        # Histories outlive this RealSense frame and the next camera read.
+        image = image.copy()
         self._last_image = image
-        return image, depth
+        frame = {"image": image, "capture_timestamp": capture_timestamp,
+                 "host_timestamp": host_timestamp, "timestamp_domain": timestamp_domain,
+                 "frame_number": color.get_frame_number()}
+        if include_depth:
+            frame["depth"] = np.zeros(image.shape[:2] + (1,), dtype=np.uint16)
+        return frame
 
     def close(self) -> None:
         self._camera.disconnect()

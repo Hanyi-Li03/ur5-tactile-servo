@@ -50,7 +50,7 @@ python tactile_policy/infer_tactile_servo_nutbolt_miben_lhy_new.py --help
 python launch_nodes.py \
   --robot ur --robot-ip 192.168.1.102 \
   --camera-backend lerobot \
-  --camera-width 424 --camera-height 240 --camera-fps 15 \
+  --camera-width 640 --camera-height 480 --camera-fps 30 \
   --tactile-source xense \
   --xense-left-serial OG001783 --xense-right-serial OG001782
 ```
@@ -59,7 +59,7 @@ python launch_nodes.py \
 仅做不依赖相机的推理时，服务端可加 `--no-enable-camera`。
 FTS-300 由采集/推理客户端按原有参数直接读取，不由启动器另建节点。
 
-采集仍使用原脚本及参数；默认新数据写入本副本的 `data/ur5_tactile`，
+采集仍使用原脚本入口；默认新数据写入本副本的 `data/ur5_tactile_30hz`，
 也可通过 `--root /绝对路径/新数据集` 指定其他目录。采集默认会控制机械臂，
 需要事先核对标定位置、工作空间、力限制和串口。不要用 `--overwrite` 指向要保留的数据。
 
@@ -83,4 +83,53 @@ python tactile_policy/infer_tactile_servo_nutbolt_miben_lhy_new.py \
 - 删除 UR 模块里未使用的其他夹爪导入，不复制不相关设备代码。
 
 迁移检查只执行语法、导入、命令行帮助及模拟对象检查，不代表已完成实机安全验证。
+
+## 通讯与硬件优化
+
+移植自 [Asgod-1/ur5-rg2-tactile-force 的 273a317 提交](https://github.com/Asgod-1/ur5-rg2-tactile-force/commit/273a3172ee616511c8df0f77f9c221036db409c3)，
+按本项目的 `gello/`、`real_ur5rg2/` 目录适配。螺母/螺栓标定、随机复位、力与触觉限值、
+`distributed_force` 字段、指尖中心相对螺母位姿字段及 `L` 自动采集流程保持兼容。
+
+- RG2 脚本由后台线程执行，只保留最新待执行目标；夹爪忙时暂停手臂命令，失败时报告错误。
+  自动采集等待脚本完成再推进闭合/打开阶段。ZMQ 客户端默认仍等待夹爪完成，兼容原有两份推理；
+  采集器显式使用 `blocking_gripper=False`，开合期间可继续录制。
+- FT300-S 新增默认 `100 Hz` 连续流，串口为 `19200` 波特率，逐包验证 CRC、错包重同步。
+  打开后立即后台接收，避免等待续采选择或去零期间积压。可选 FTDI 低延迟模式在关闭时恢复；
+  `--force-source modbus-serial` 可使用原问答模式。后台样本默认超过 `0.1 s` 或读取失败时，
+  跳过该轮运动和记录，不使用旧力数据。
+- 双 Xense 公平排队访问 SDK；创建 ONNX 会话时使用 intra-op `6`、inter-op `1` 并关闭自旋。
+  以原始 `CaptureTimeStamp` 去重；录制最多回看上一帧，控制与保护使用最新触觉。
+  停更或捕获结果超过 `0.15 s` 时报告错误，可通过启动器的 `--xense-max-age-s` 调整。
+- 相机默认 `640×480 @ 30 fps`；采集使用 RGB 专用接口并携带原生帧时间，省去零深度占位图的分配和传输。
+  兼容原 RGB/深度接口，以及 `--camera-backend gello` / `realsense`。
+- 录制默认以触觉捕获时间（禁用触觉时以 RGB 时间）配对各路短历史，每路距参考时间最多 `20 ms`。
+  UR 状态用原生控制器时间去重和映射，配套记录同一状态包内的 TCP 位姿，避免指尖标签错配。
+  缺少新帧时跳行，允许有限次数重选，不重复旧帧补足标称频率。
+- 新采与续采都使用后台无损 PNG 写图，默认压缩级别 `1`；图像像素不变，文件通常更大。
+  `--image-png-compress-level 6` 可恢复较高压缩。ZMQ 超时后重建请求连接，当前调用报错，
+  不自动重发可能已经执行的运动命令；退出时释放后台线程、串口、相机、RTDE 和 ZMQ 资源。
+
+更新后重启 `launch_nodes.py` 和采集进程。新采示例：
+
+```bash
+python real_ur5rg2/collect_lerobot_xenstactile_servo_control.py \
+  --root ./data/ur5_tactile_30hz --fps 30 \
+  --image-width 640 --image-height 480 \
+  --force-serial-port /dev/ttyUSB0 --no-preview
+```
+
+按 `P` 后先等待 `Recording ready` 再开始任务动作；`L` 自动流程在闭合等待结束后保存首条有效配对数据。
+保存 episode 时附加 `meta/tactile_timing/`、`meta/sensor_timing/` 和 `meta/recording_performance/`，
+用于检查真实帧率、时差、预热、跳行和阶段耗时，不改变训练使用的标准 `timestamp`。
+软件时间配对包含主机时钟和传输延迟估计，不等同于物理采样同步，实际帧率需在本机实测。
+
+续采已有数据时显式传入原 `--root`、帧率及图像尺寸；原默认配置可用 `--fps 20 --image-size 256`。
+尺寸或帧率不匹配时会报错，不修改旧数据。可用 `--no-recording-time-alignment` 关闭时间配对，
+`--no-tactile-recording-buffer` 关闭触觉录制缓冲，便于按原行为对照。
+
+无实机回归测试（需要现有项目环境中的 pytest）：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q tests/test_hardware_sync.py
+```
 
