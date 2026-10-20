@@ -1,8 +1,10 @@
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+import time
 
 import numpy as np
 import threading
 from gello.robots.robot import Robot
+from gello.robots.rtde_timing import RTDETimestampTracker
 
 
 class URRobot(Robot):
@@ -43,6 +45,8 @@ class URRobot(Robot):
         self._free_drive = False
         self.robot.endFreedriveMode()
         self._use_gripper = not no_gripper
+        # 将 UR 控制器包时间映射到主机时间；此线程只读时间，不发送运动命令。
+        self._timestamp_tracker = RTDETimestampTracker(self.r_inter)
 
     def num_dofs(self) -> int:
         """Get the number of joints of the robot.
@@ -211,18 +215,50 @@ class URRobot(Robot):
             self._free_drive = False
             self.robot.endFreedriveMode()
 
-    def get_observations(self) -> Dict[str, np.ndarray]:
-        joints = self.get_joint_state()
+    def get_observations(self) -> Dict[str, Any]:
+        started = time.time()
+        # q 和 TCP 必须属于同一个 RTDE 包，才能共用关节参考时间。
+        # 在读取前后核对原生包时间；最多重读三次，失败时禁止用于时间配对。
+        for _ in range(3):
+            native_before = self.r_inter.getTimestamp()
+            joints = np.asarray(self.r_inter.getActualQ(), dtype=float)
+            tcp_pose = self.get_tcp_pose()
+            tcp_force = self.get_tcp_force()
+            native_after = self.r_inter.getTimestamp()
+            if native_before == native_after:
+                break
+        received = time.time()
+        received_monotonic = time.monotonic()
+        mapped = self._timestamp_tracker.stamp(native_before)
+        # t_wall = t_wall_now + (t_mapped_monotonic - t_monotonic_now)。
+        # 预热期间仍可读取最新状态，但 consistent=False，不保存同步样本。
+        observation_timestamp = ((started + received) / 2 if mapped is None
+                                 else received + mapped.monotonic - received_monotonic)
+        if self._use_gripper:
+            # 夹爪值仍是原来的命令缓存，不把等待夹爪的时间算入 RTDE 快照。
+            joints = np.append(joints, self.last_gripper_scalar)
         pos_quat = np.zeros(7)
         gripper_pos = np.array([joints[-1]])
-        tcp_force = self.get_tcp_force()
         return {
             "joint_positions": joints,
             "joint_velocities": joints,
             "ee_pos_quat": pos_quat,
             "gripper_position": gripper_pos,
             "tcp_force": tcp_force,
+            "tcp_pose": tcp_pose,
+            "observation_timestamp": observation_timestamp,
+            "observation_received_timestamp": received,
+            "rtde_timestamp": native_before,
+            "rtde_timestamp_consistent": native_before == native_after and mapped is not None,
+            "observation_time_basis": "ur_rtde_clock_mapped" if mapped is not None else "clock_warmup",
+            "rtde_clock_epoch": None if mapped is None else mapped.epoch,
+            "rtde_clock_drift_ppm": None if mapped is None else mapped.drift_ppm,
+            "rtde_observed_jitter_ms": None if mapped is None else mapped.observed_jitter_s * 1000,
+            "rtde_minimum_transport_delay_unknown": True,
         }
+
+    def close(self) -> None:
+        self._timestamp_tracker.close()
 
 
 def main():

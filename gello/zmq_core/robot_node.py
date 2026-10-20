@@ -68,7 +68,10 @@ class ZMQServerRobot:
                         raise NotImplementedError("Robot does not expose command_gripper")
                     result = self._robot.command_gripper(**args)
                 elif method == "get_observations":
-                    result = self._robot.get_observations()
+                    try:
+                        result = self._robot.get_observations()
+                    except RuntimeError as exc:
+                        result = {"error": str(exc)}
                 else:
                     result = {"error": "Invalid method"}
                     print(result)
@@ -84,6 +87,9 @@ class ZMQServerRobot:
     def stop(self) -> None:
         """Signal the server to stop serving."""
         self._stop_event.set()
+        close = getattr(self._robot, "close", None)
+        if callable(close):
+            close()
 
 
 class ZMQClientRobot(Robot):

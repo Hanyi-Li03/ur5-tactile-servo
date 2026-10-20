@@ -21,6 +21,9 @@ from gello.force.robotiq_fts300 import (
 )
 from gello.zmq_core.robot_node import ZMQClientRobot
 from gello.zmq_core.tactile_node import ZMQClientTactile
+from real_ur5rg2.tactile_time_sync import (
+    JointTactileSynchronizer, TactileSyncUnavailable, save_episode_with_tactile_timing,
+)
 
 
 TACTILE_FIELD_KEYS = (
@@ -254,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-id", default="ur5_rg2_real_smolvla_xense_tactile")
     parser.add_argument(
         "--root",
-        default="./real_ur5rg2/data/L1_5000_ur5_rg2_real_dataset_xense_tactile_boltnut_demo",
+        default="./real_ur5rg2/data/L1_5000_xense_tactile_boltnut_demo",
     )
     parser.add_argument("--task", default="Insert the bolt into the nut.")
     parser.add_argument("--num-episodes", type=int, default=20)
@@ -319,6 +322,14 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="When collecting tactile data, skip frames whose Xense source reports valid=False.",
+    )
+    parser.add_argument(
+        "--tactile-time-sync", action=argparse.BooleanOptionalAction, default=True,
+        help="Pair both tactile captures to an actual joint/TCP snapshot when recording.",
+    )
+    parser.add_argument(
+        "--tactile-sync-max-skew-ms", type=float, default=20.0,
+        help="Maximum capture-time difference from the joint reference, per tactile sensor.",
     )
     parser.add_argument(
         "--collect-force",
@@ -554,6 +565,8 @@ def parse_args() -> argparse.Namespace:
         help="Alias for --no-collect-tactile.",
     )
     args = parser.parse_args()
+    if not np.isfinite(args.tactile_sync_max_skew_ms) or not 0 < args.tactile_sync_max_skew_ms <= 50:
+        parser.error("--tactile-sync-max-skew-ms must be in (0, 50].")
     if args.xense_depth_height is None:
         args.xense_depth_height = args.xense_force_height
     if args.xense_depth_width is None:
@@ -730,11 +743,13 @@ def resize_rgb(image: np.ndarray, image_size: int) -> np.ndarray:
     return np.asarray(image, dtype=np.uint8)
 
 
-def reset_episode_buffer(dataset: LeRobotDataset) -> None:
+def reset_episode_buffer(dataset: LeRobotDataset, synchronizer=None) -> None:
     if dataset.episode_buffer is None:
         dataset.episode_buffer = dataset.create_episode_buffer()
     else:
         dataset.clear_episode_buffer()
+    if synchronizer is not None:
+        synchronizer.reset()
 
 
 def dataset_has_tactile_features(dataset: LeRobotDataset) -> bool:
@@ -1099,6 +1114,7 @@ def empty_tactile_frame(
         "rectify": np.zeros((rectify_height, rectify_width, 3), dtype=np.uint8),
         "timestamp": 0.0,
         "host_timestamp": 0.0,
+        "capture_timestamp": 0.0,
         "valid": False,
     }
 
@@ -1302,6 +1318,9 @@ def format_tactile_frame(
     )
     formatted["host_timestamp"] = (
         _float_or_zero(frame.get("host_timestamp")) if formatted["valid"] else 0.0
+    )
+    formatted["capture_timestamp"] = (
+        _float_or_zero(frame.get("capture_timestamp")) if formatted["valid"] else 0.0
     )
     return formatted
 
@@ -1899,6 +1918,13 @@ def main() -> None:
         if left_tactile is not None and right_tactile is not None:
             format_tactile_frame_from_args(left_tactile.read(), args)
             format_tactile_frame_from_args(right_tactile.read(), args)
+            if args.tactile_time_sync:
+                # 旧节点没有历史接口/同包 TCP 时启动即报错，避免静默退回不同步保存。
+                observation = robot.get_observations()
+                if "observation_timestamp" not in observation or "tcp_pose" not in observation:
+                    raise RuntimeError("Robot timing interface is missing; restart launch_nodes.py")
+                left_tactile.recording_timestamps()
+                right_tactile.recording_timestamps()
         if force_reader is not None:
             force_reader.read()
     except (ModuleNotFoundError, RuntimeError) as exc:
@@ -1931,6 +1957,11 @@ def main() -> None:
 
     dataset = make_dataset(args)
     store_tactile, store_force = validate_requested_sensor_features(dataset, args)
+    synchronizer = (JointTactileSynchronizer(args.tactile_sync_max_skew_ms / 1000)
+                    if store_tactile and args.collect_tactile and args.tactile_time_sync else None)
+    if synchronizer is not None:
+        print("Joint-referenced tactile sync enabled: "
+              f"each side within {args.tactile_sync_max_skew_ms:.0f} ms; unmatched rows are skipped")
     if store_tactile:
         print(
             "Xense tactile will be saved as "
@@ -1984,6 +2015,7 @@ def main() -> None:
     last_tactile_invalid_print = 0.0
     last_tactile_safety_print = 0.0
     last_tactile_wrench_print = 0.0
+    last_tactile_sync_print = 0.0
 
     print("Keyboard teleop controls:")
     print("  W/S/A/D/R/F: translate TCP")
@@ -2010,6 +2042,13 @@ def main() -> None:
             #     f"[x,y,z]=[{tcp_pose[0]: .4f}, {tcp_pose[1]: .4f}, {tcp_pose[2]: .4f}]"
             # )
             obs_before = robot.get_observations()
+            if synchronizer is not None:
+                try:
+                    synchronizer.add_state(obs_before)
+                except TactileSyncUnavailable as exc:
+                    if time.time() - last_tactile_sync_print > 1.0:
+                        print(f"Tactile time sync: {exc}")
+                        last_tactile_sync_print = time.time()
             current_joints = np.asarray(obs_before["joint_positions"], dtype=np.float32)
 
             tactile_read_error = None
@@ -2113,7 +2152,7 @@ def main() -> None:
                 recording = False
                 frames_in_episode = 0
                 save_auto_frame = False
-                reset_episode_buffer(dataset)
+                reset_episode_buffer(dataset, synchronizer)
                 dpos = np.zeros(3, dtype=np.float64)
                 drot = np.eye(3)
                 gripper = 0.0
@@ -2147,7 +2186,7 @@ def main() -> None:
                     reset_sequence_phase = None
                 elif abs(float(current_joints[-1])) <= 0.03:
                     # 确认夹爪实际打开后，才创建并录制下一条 episode。
-                    reset_episode_buffer(dataset)
+                    reset_episode_buffer(dataset, synchronizer)
                     # 移动过程中不保存
                     recording = False
                     frames_in_episode = 0
@@ -2156,8 +2195,8 @@ def main() -> None:
                     reset_sequence_phase = "request_reset"
                     print(f"Start recording episode {episode_id}")
 
-            # 到达随机复位姿态后，执行“闭合、等待 1 秒、自动保存”。
-            elif reset_sequence_phase in {"closing", "waiting_to_save"}:
+            # 到达随机复位姿态后，执行“闭合、等待 0.5 秒、自动保存”。
+            elif reset_sequence_phase in {"closing", "waiting_to_save", "saving"}:
                 # 自动闭合和等待期间持续保持夹爪闭合目标。
                 teleop.gripper_closed = True
                 gripper = 1.0
@@ -2181,15 +2220,19 @@ def main() -> None:
                         print(
                             f"夹爪已闭合，等待 {AUTO_RESET_CLOSE_WAIT_SECONDS:.1f} 秒后自动保存"
                         )
+                elif reset_sequence_phase == "saving":
+                    # 配对/相机读取可能跳帧：保持夹紧，直到真正保存一组有效数据。
+                    recording = True
+                    save_auto_frame = True
                 elif (
                     reset_close_wait_until is not None
                     and time.monotonic() >= reset_close_wait_until
                 ):
-                    # 等待结束后生成与 ENTER 相同的 done 事件，复用保存逻辑。
-                    reset_sequence_phase = None
+                    # 等待结束后保持 saving，配对成功并保存后才打开夹爪。
+                    reset_sequence_phase = "saving"
                     reset_close_wait_until = None
 
-                    reset_episode_buffer(dataset)
+                    reset_episode_buffer(dataset, synchronizer)
                     frames_in_episode = 0
                     recording = True
                     save_auto_frame = True
@@ -2199,7 +2242,7 @@ def main() -> None:
                 # 手动清空 episode 时同时终止 L 自动流程。
                 reset_sequence_phase = None
                 reset_close_wait_until = None
-                reset_episode_buffer(dataset)
+                reset_episode_buffer(dataset, synchronizer)
                 if force_safety is not None:
                     force_safety.reset()
                 recording = False
@@ -2215,7 +2258,7 @@ def main() -> None:
                 # 记录当前 episode 是否确实包含数据并成功调用保存。
                 episode_saved = False
                 if recording and frames_in_episode > 0:
-                    dataset.save_episode()
+                    save_episode_with_tactile_timing(dataset, synchronizer)
                     print(f"Saved episode {episode_id} ({frames_in_episode} frames)")
                     episode_id += 1
                     episode_saved = True
@@ -2242,7 +2285,7 @@ def main() -> None:
                 if not recording:
                     recording = True
                     frames_in_episode = 0
-                    reset_episode_buffer(dataset)
+                    reset_episode_buffer(dataset, synchronizer)
                     if force_safety is not None:
                         force_safety.reset()
                     print(f"Start recording episode {episode_id}")
@@ -2252,7 +2295,7 @@ def main() -> None:
                 reset_sequence_phase = None
                 reset_close_wait_until = None
                 if recording and frames_in_episode > 0:
-                    dataset.save_episode()
+                    save_episode_with_tactile_timing(dataset, synchronizer)
                     print(f"Saved episode {episode_id} before exit ({frames_in_episode} frames)")
                 break
 
@@ -2268,7 +2311,7 @@ def main() -> None:
             if event == "random_reset_pose":
                 # 第一次手动按 L 或自动进入下一轮时，确保当前 episode 已经开始录制。
                 if not recording:
-                    reset_episode_buffer(dataset)
+                    reset_episode_buffer(dataset, synchronizer)
                     recording = False
                     frames_in_episode = 0
                     if force_safety is not None:
@@ -2477,9 +2520,24 @@ def main() -> None:
                 continue
 
             obs_after = robot.get_observations()
-            # 保存执行本帧命令后的实际 TCP 位姿，与 _L.py 的数据内容保持一致。
+            if synchronizer is not None:
+                try:
+                    synchronizer.add_state(obs_after)
+                    if recording:
+                        # 以历史中可配对的 t_joint 为参考；q 与标签 TCP 同包。
+                        # 左右触觉各满足 |t_capture - t_joint| <= 默认 20 ms。
+                        obs_after, matched_tactile_frames = synchronizer.select(left_tactile, right_tactile)
+                        left_tactile_frame, right_tactile_frame = [
+                            format_tactile_frame_from_args(frame, args) for frame in matched_tactile_frames
+                        ]
+                except RuntimeError as exc:
+                    if time.time() - last_tactile_sync_print > 1.0:
+                        print(f"Tactile time sync skipped a frame: {exc}")
+                        last_tactile_sync_print = time.time()
+                    continue
+            # 同步时标签来自参考关节反馈内的 TCP，不另查较晚时刻的 TCP。
             tcp_pose_after_rotvec = np.asarray(
-                robot.get_tcp_pose(),
+                obs_after["tcp_pose"] if synchronizer is not None else robot.get_tcp_pose(),
                 dtype=np.float32,
             )
             # tcp_pose_after_rpy = tcp_pose_rotvec_to_rpy(
@@ -2504,7 +2562,7 @@ def main() -> None:
             # ):
             #     recording = True
             #     frames_in_episode = 0
-            #     reset_episode_buffer(dataset)
+            #     reset_episode_buffer(dataset, synchronizer)
             #     print(f"Start recording episode {episode_id}")
 
             if recording:
@@ -2560,9 +2618,11 @@ def main() -> None:
                     frame[FORCE_TORQUE_KEY] = force_torque
 
                 dataset.add_frame(frame, task=args.task)
+                if synchronizer is not None:
+                    synchronizer.commit(obs_after, matched_tactile_frames, frames_in_episode)
                 frames_in_episode += 1
                 if save_auto_frame:
-                    dataset.save_episode()
+                    save_episode_with_tactile_timing(dataset, synchronizer)
                     print(
                         f"Saved episode {episode_id} "
                         f"({frames_in_episode} frame)"
