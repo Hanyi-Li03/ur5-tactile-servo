@@ -82,22 +82,63 @@ def load_lerobot_tactile_dataset(
         raise FileNotFoundError(f"No parquet files found under {data_dir}")
     # Explicit sorting makes the train/validation split and --sample-index
     # reproducible across filesystems.
-    table = pads.dataset([str(path) for path in parquet_files], format="parquet").to_table(
-        columns=[LEFT_FORCE_KEY, RIGHT_FORCE_KEY, POSE_KEY]
-    )
-    if table.num_rows == 0:
+
+    # # 1. 一次性读取所有 Parquet 文件的三个训练字段。
+    # table = pads.dataset([str(path) for path in parquet_files], format="parquet").to_table(
+    #     columns=[LEFT_FORCE_KEY, RIGHT_FORCE_KEY, POSE_KEY]
+    # )
+    # if table.num_rows == 0:
+    #     raise ValueError(f"No samples found under {data_dir}")
+
+    # left = np.asarray(table[LEFT_FORCE_KEY].to_pylist(), dtype=np.float32)
+    # right = np.asarray(table[RIGHT_FORCE_KEY].to_pylist(), dtype=np.float32)
+    # targets = np.asarray(table[POSE_KEY].to_pylist(), dtype=np.float32)
+    # if targets.ndim != 2 or targets.shape[1] != 6:
+    #     raise ValueError(f"Expected {POSE_KEY} shape (N, 6), got {targets.shape}")
+
+    # left = _force_to_chw(left, grid_size)
+    # right = _force_to_chw(right, grid_size)
+    # inputs = np.concatenate((left, right), axis=1)
+    # return signed_log1p(inputs).astype(np.float32), targets
+
+    input_parts = []
+    target_parts = []
+
+    # 按文件读取：这里一个文件就是一个 episode。兼容原来的数据
+    for path in parquet_files:
+        table = pads.dataset(str(path), format="parquet").to_table(
+            columns=[LEFT_FORCE_KEY, RIGHT_FORCE_KEY, POSE_KEY]
+        )
+        if table.num_rows == 0:
+            continue
+
+        # 保留原来的转换方式，只处理当前 episode。
+        left = np.asarray(table[LEFT_FORCE_KEY].to_pylist(), dtype=np.float32)
+        right = np.asarray(table[RIGHT_FORCE_KEY].to_pylist(), dtype=np.float32)
+        targets = np.asarray(table[POSE_KEY].to_pylist(), dtype=np.float32)
+
+        if targets.ndim != 2 or targets.shape[1] != 6:
+            raise ValueError(
+                f"Expected {POSE_KEY} shape (N, 6), got {targets.shape}"
+            )
+
+        left = _force_to_chw(left, grid_size)
+        right = _force_to_chw(right, grid_size)
+        inputs = np.concatenate((left, right), axis=1)
+
+        # 每个 episode 单独预处理，避免全量计算产生大临时数组。
+        input_parts.append(signed_log1p(inputs).astype(np.float32))
+        target_parts.append(targets)
+
+        del table, left, right, inputs
+
+    if not input_parts:
         raise ValueError(f"No samples found under {data_dir}")
 
-    left = np.asarray(table[LEFT_FORCE_KEY].to_pylist(), dtype=np.float32)
-    right = np.asarray(table[RIGHT_FORCE_KEY].to_pylist(), dtype=np.float32)
-    targets = np.asarray(table[POSE_KEY].to_pylist(), dtype=np.float32)
-    if targets.ndim != 2 or targets.shape[1] != 6:
-        raise ValueError(f"Expected {POSE_KEY} shape (N, 6), got {targets.shape}")
-
-    left = _force_to_chw(left, grid_size)
-    right = _force_to_chw(right, grid_size)
-    inputs = np.concatenate((left, right), axis=1)
-    return signed_log1p(inputs).astype(np.float32), targets
+    return (
+        np.concatenate(input_parts, axis=0),
+        np.concatenate(target_parts, axis=0),
+    )
 
 
 def fit_normalization(inputs: np.ndarray, targets: np.ndarray) -> Normalization:
